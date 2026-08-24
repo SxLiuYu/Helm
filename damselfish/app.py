@@ -219,6 +219,12 @@ load();setInterval(load,10000);
         raw_project = x_damselfish_project or extension.get("project_id")
         if not raw_project:
             raw_project = _infer_project_id(payload.get("messages", []))
+        # Track whether the project was actually identified (header,
+        # extension, or system-prompt inference).  The "default" bucket
+        # mixes unrelated stateless clients, so cross-session context
+        # injection must never draw from it — doing so leaked one
+        # client's history into another's conversation.
+        project_identified = bool(raw_project)
         project_id = _identifier(raw_project or "default", "project_id")
         if not session_id:
             session_id = _derive_session_id(payload.get("messages", []))
@@ -237,7 +243,9 @@ load();setInterval(load,10000);
         header_scenario = scenario
         header_persona = persona
         memory_enabled = bool(extension.get("memory", True)) and bool(session_id)
-        project_memory_enabled = bool(extension.get("project_memory", True))
+        project_memory_enabled = (
+            bool(extension.get("project_memory", True)) and project_identified
+        )
         incoming = payload["messages"]
         history = []
         transcript = list(incoming)
@@ -284,7 +292,7 @@ load();setInterval(load,10000);
             # messages for the key so memory merge doesn't break cache hits.
             cache_cfg = loaded.routing
             if cache_cfg.cache_enabled:
-                cache_key = _cache_key({"messages": incoming, "model": payload.get("model","auto"), "tools": payload.get("tools",[])}, context)
+                cache_key = _cache_key({"messages": incoming, "model": payload.get("model","auto"), "tools": payload.get("tools",[])}, context, project_id)
                 cached = _cache_get(request.app.state, cache_key, cache_cfg.cache_ttl_seconds)
                 if cached is not None:
                     headers = {
@@ -303,7 +311,7 @@ load();setInterval(load,10000);
                 payload, context, decision_session
             )
             if cache_cfg.cache_enabled:
-                _cache_set(request.app.state, _cache_key({"messages": incoming, "model": payload.get("model","auto"), "tools": payload.get("tools",[])}, context), {
+                _cache_set(request.app.state, _cache_key({"messages": incoming, "model": payload.get("model","auto"), "tools": payload.get("tools",[])}, context, project_id), {
                     "target_id": result.target.id,
                     "model": result.target.model,
                     "body": result.body,
@@ -355,8 +363,12 @@ def build_default_app() -> FastAPI:
 # ------------------------------------------------------------------ #
 # Caching
 # ------------------------------------------------------------------ #
-def _cache_key(payload: dict[str, Any], context) -> str:
-    """Build a stable cache key from messages, model, scenario, persona."""
+def _cache_key(payload: dict[str, Any], context, project_id: str = "") -> str:
+    """Build a stable cache key from messages, model, scenario, persona.
+
+    The project id is part of the key: identical opening prompts from
+    different projects must never share cached responses.
+    """
     import hashlib
     raw = json.dumps({
         "messages": payload.get("messages", []),
@@ -364,6 +376,7 @@ def _cache_key(payload: dict[str, Any], context) -> str:
         "scenario": context.scenario,
         "persona": context.persona,
         "tools": payload.get("tools", []),
+        "project": project_id,
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -570,6 +583,8 @@ async def _handle_streaming(
         if result is not None:
             target_id = result.target.id
             target_model = result.target.model
+        log.info("stream response target=%s content_preview=%s",
+                 target_id, repr(full_content[:200]))
         if memory_enabled and session_id and accumulated_content:
             assistant = {"role": "assistant", "content": "".join(accumulated_content)}
             request.app.state.store.save_session(
@@ -626,29 +641,46 @@ def _infer_project_id(messages: list[dict[str, Any]]) -> str | None:
 
 
 def _derive_session_id(messages: list[dict[str, Any]]) -> str | None:
-    """Derive a stable session id from the first user message.
+    """Derive a stable session id from the opening messages.
 
     Enables memory, context, and cloud sync for stateless clients (e.g.
     agentic coding tools) that send the full conversation in each request
-    but omit ``X-Damselfish-Session`` headers.  The same opening user
-    message always maps to the same session id, so conversations stay
-    continuous across requests, devices, and agents.
+    but omit ``X-Damselfish-Session`` headers.  The same opening messages
+    always map to the same session id, so conversations stay continuous
+    across requests, devices, and agents.
+
+    The first system prompt is part of the fingerprint: different projects
+    running through a stateless client often start with identical user
+    text ("继续", "评估这个项目"), and hashing the user message alone
+    would merge those conversations into one session.
     """
-    first_user = next(
-        (m.get("content") for m in messages
-         if isinstance(m, dict) and m.get("role") == "user"),
-        None,
-    )
-    fingerprint = ""
-    if isinstance(first_user, str):
-        fingerprint = first_user.strip()[:2000]
-    elif isinstance(first_user, list):
-        fingerprint = " ".join(
-            p.get("text", "") for p in first_user
-            if isinstance(p, dict) and p.get("type") == "text"
-        ).strip()[:2000]
-    if not fingerprint:
+    first_user = None
+    first_system = None
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if first_system is None and msg.get("role") == "system":
+            if isinstance(content, str):
+                first_system = content
+            elif isinstance(content, list):
+                first_system = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+        if first_user is None and msg.get("role") == "user":
+            if isinstance(content, str):
+                first_user = content.strip()[:2000] or None
+            elif isinstance(content, list):
+                first_user = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ).strip()[:2000] or None
+        if first_user is not None and first_system is not None:
+            break
+    if not first_user:
         return None
+    fingerprint = f"{first_system or ''}\x00{first_user}"
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
 
 

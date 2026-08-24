@@ -93,7 +93,7 @@ class ModelRouter:
                 session_id, context.scenario, context.persona, primary.id,
                 None, False, error.status, str(error),
             )
-            if (error.status not in (429, 504) and not _is_context_overflow(error)) or len(targets) < 2:
+            if (error.status not in (429, 502, 504) and not _is_context_overflow(error)) or len(targets) < 2:
                 raise NoTargetAvailable(
                     f"primary target {primary.id} failed: HTTP {error.status} {error}"
                 ) from error
@@ -148,6 +148,28 @@ class ModelRouter:
         iterator = self._stream_call(primary, payload)
         try:
             first_chunk = await iterator.__anext__()
+            # Buffer initial content chunks to detect canned refusals
+            # before committing the stream to the client.  Refusals are
+            # short (~50 chars) and contain only content (no reasoning),
+            # so 120 chars is enough.  If we see reasoning_content, the
+            # response is legitimate — stop buffering immediately.
+            buffered = [first_chunk]
+            _buf_content = _extract_chunk_content(first_chunk)
+            _has_reasoning = _chunk_has_reasoning(first_chunk)
+            try:
+                while not _has_reasoning and len(_buf_content) < _REFUSAL_CHECK_CHARS:
+                    chunk = await iterator.__anext__()
+                    buffered.append(chunk)
+                    _buf_content += _extract_chunk_content(chunk)
+                    _has_reasoning = _chunk_has_reasoning(chunk)
+            except StopAsyncIteration:
+                pass  # stream ended early — all content is in buffer
+            if _is_canned_refusal(_buf_content):
+                log.info("canned refusal detected from %s, falling back: %s",
+                         primary.id, repr(_buf_content[:80]))
+                raise UpstreamFailure(
+                    primary, 502, f"canned refusal: {_buf_content[:80]}",
+                )
         except StopAsyncIteration:
             raise NoTargetAvailable(f"primary target {primary.id} returned empty stream")
         except UpstreamFailure as error:
@@ -155,7 +177,7 @@ class ModelRouter:
                 session_id, context.scenario, context.persona, primary.id,
                 None, False, error.status, str(error),
             )
-            if (error.status not in (429, 504) and not _is_context_overflow(error)) or len(targets) < 2:
+            if (error.status not in (429, 502, 504) and not _is_context_overflow(error)) or len(targets) < 2:
                 raise NoTargetAvailable(
                     f"primary target {primary.id} failed: HTTP {error.status} {error}"
                 ) from error
@@ -223,8 +245,9 @@ class ModelRouter:
                         )
             return
 
-        # Phase 1 succeeded: yield first chunk, then continue streaming
-        yield first_chunk
+        # Phase 1 succeeded: yield buffered chunks, then continue streaming
+        for chunk in buffered:
+            yield chunk
         async for chunk in iterator:
             yield chunk
         self._stream_result = CompletionResult(body={}, target=primary, latency_ms=0)
@@ -461,6 +484,16 @@ class ModelRouter:
             if target.api_format == "messages":
                 body = _from_messages_response(body, target.model)
             _validate_completion(body)
+            _refusal_text = ""
+            try:
+                _rmsg = body.get("choices", [{}])[0].get("message", {})
+                _refusal_text = str(_rmsg.get("content", "") or _rmsg.get("reasoning_content", "") or "")
+            except (IndexError, TypeError, AttributeError):
+                pass
+            if _is_canned_refusal(_refusal_text):
+                raise UpstreamFailure(
+                    target, 502, f"canned refusal: {_refusal_text[:80]}",
+                )
         except UpstreamFailure as error:
             self._record_failure(target, error.status, str(error), probe)
             raise
@@ -480,6 +513,14 @@ class ModelRouter:
             total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
         )
         body["model"] = target.model
+        _content = ""
+        try:
+            _msg = body.get("choices", [{}])[0].get("message", {})
+            _content = str(_msg.get("content", "") or _msg.get("reasoning_content", "") or "")
+        except (IndexError, TypeError, AttributeError):
+            pass
+        log.info("non-stream response target=%s latency_ms=%.0f content_preview=%s",
+                 target.id, latency_ms, repr(_content[:200]))
         return CompletionResult(body=body, target=target, latency_ms=latency_ms)
 
     async def _stream_call(
@@ -919,6 +960,48 @@ def _validate_completion(body: Any) -> None:
     )
     if not usable:
         raise ValueError("assistant message has no usable content, reasoning, or tool call")
+
+
+_CANNED_REFUSAL_PATTERNS = [
+    "作为一个人工智能语言模型，我还没学习如何回答",
+    "作为一个人工智能语言模型，我还没有学习",
+    "作为一个人工智能，我还没有学习",
+    "作为AI语言模型，我无法",
+    "我还没有学习到这方面的知识",
+    "抱歉，我还没有学习到",
+    "我无法回答这个问题",
+    "这个问题我无法回答",
+]
+_REFUSAL_CHECK_CHARS = 120
+
+
+def _is_canned_refusal(content: str) -> bool:
+    """Detect short canned refusal responses that bypass HTTP-level errors."""
+    if not content or len(content) > 200:
+        return False
+    return any(p in content for p in _CANNED_REFUSAL_PATTERNS)
+
+
+def _extract_chunk_content(chunk: dict[str, Any]) -> str:
+    """Extract text content from a stream chunk's delta."""
+    choices = chunk.get("choices")
+    if not choices:
+        return ""
+    delta = choices[0].get("delta", {})
+    if isinstance(delta, dict):
+        return str(delta.get("content", "") or "")
+    return ""
+
+
+def _chunk_has_reasoning(chunk: dict[str, Any]) -> bool:
+    """Check if a stream chunk carries reasoning_content (not a canned refusal)."""
+    choices = chunk.get("choices")
+    if not choices:
+        return False
+    delta = choices[0].get("delta", {})
+    if isinstance(delta, dict):
+        return bool(delta.get("reasoning_content"))
+    return False
 
 
 def _error_message(response: httpx.Response) -> str:
