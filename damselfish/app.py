@@ -95,6 +95,8 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         expected = os.environ.get("DAMSELFISH_API_KEY")
         api_request = request.url.path.startswith("/v1/")
         admin_request = request.url.path.startswith("/admin/api/")
+        # Localhost admin requests are trusted (no login needed for embedded iframe)
+        localhost = request.client.host in ("127.0.0.1", "::1", "localhost")
         if admin_request and not expected:
             return JSONResponse(
                 status_code=503,
@@ -106,7 +108,8 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             session_valid = admin_request and _valid_admin_session(
                 request.cookies.get("damselfish_admin"), expected
             )
-            if not bearer_valid and not session_valid:
+            # Localhost admin API requests skip auth (embedded iframe in DSH)
+            if not bearer_valid and not session_valid and not (admin_request and localhost):
                 return JSONResponse(
                     status_code=401,
                     content={"error": {"message": "invalid Damselfish API key"}},
@@ -131,6 +134,71 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         app.state.config = loaded
         app.state.store.ensure_targets(ids)
         app.state.router.reconfigure(loaded)
+
+    @app.get("/", include_in_schema=False)
+    async def dashboard_page() -> HTMLResponse:
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Damselfish Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}
+h1{color:#4472C4;margin-bottom:16px;font-size:22px}
+.summary{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.card{background:#16213e;border-radius:10px;padding:14px 18px;min-width:120px}
+.card .num{font-size:28px;font-weight:700;color:#4472C4}
+.card .label{font-size:12px;color:#888;margin-top:2px}
+table{width:100%;border-collapse:collapse;background:#16213e;border-radius:10px;overflow:hidden}
+th{background:#0f3460;padding:10px 12px;text-align:left;font-size:12px;color:#8aa;text-transform:uppercase}
+td{padding:8px 12px;border-top:1px solid#1a1a3e;font-size:13px}
+.tr-ok{color:#4CAF50} .tr-fail{color:#f44336} .tr-na{color:#666}
+.bar{height:4px;border-radius:2px;background:#1a1a3e;margin-top:2px}
+.bar-fill{height:100%;border-radius:2px;background:#4472C4}
+a{color:#4472C4;text-decoration:none} a:hover{text-decoration:underline}
+.nav{margin-bottom:16px} .nav a{margin-right:12px}
+</style></head><body>
+<h1>🐟 Damselfish Dashboard</h1>
+<div class="nav">
+  <a href="/admin/nodes">节点管理</a>
+  <a href="/health">健康状态</a>
+  <a href="/stats">统计 JSON</a>
+  <a href="/v1/models">模型列表</a>
+</div>
+<div class="summary" id="summary"></div>
+<table><thead><tr>
+  <th>模型</th><th>状态</th><th>请求数</th><th>成功</th><th>失败</th>
+  <th>Token 总量</th><th>延迟(ms)</th><th>用量条</th>
+</tr></thead><tbody id="tbody"></tbody></table>
+<script>
+async function load(){
+  const stats=await fetch('/stats',{headers:{'Authorization':'Bearer '+localStorage.getItem('dk')||''}}).then(r=>r.json()).catch(()=>null);
+  if(!stats){document.getElementById('tbody').innerHTML='<tr><td colspan=8>加载失败(需登录)</td></tr>';return;}
+  const ts=Object.values(stats.targets||{});
+  const avail=ts.filter(t=>t.available).length;
+  const totalReq=ts.reduce((s,t)=>s+t.requests,0);
+  const totalTok=ts.reduce((s,t)=>s+t.total_tokens,0);
+  document.getElementById('summary').innerHTML=`
+    <div class="card"><div class="num">${avail}/${ts.length}</div><div class="label">可用模型</div></div>
+    <div class="card"><div class="num">${totalReq}</div><div class="label">总请求</div></div>
+    <div class="card"><div class="num">${(totalTok/1e6).toFixed(1)}M</div><div class="label">总 Token</div></div>
+  `;
+  const maxTok=Math.max(...ts.map(t=>t.total_tokens),1);
+  document.getElementById('tbody').innerHTML=ts.map(t=>`
+    <tr>
+      <td>${t.target_id}</td>
+      <td class="${t.available?'tr-ok':'tr-na'}">${t.available?'✅':'❌'}</td>
+      <td>${t.requests}</td>
+      <td class="tr-ok">${t.successes}</td>
+      <td class="${t.failures>0?'tr-fail':''}">${t.failures}</td>
+      <td>${t.total_tokens>1e6?(t.total_tokens/1e6).toFixed(1)+'M':t.total_tokens}</td>
+      <td>${t.ewma_latency_ms?t.ewma_latency_ms.toFixed(0):'-'}</td>
+      <td><div class="bar"><div class="bar-fill" style="width:${(t.total_tokens/maxTok*100).toFixed(0)}%"></div></div></td>
+    </tr>`).join('');
+}
+load();setInterval(load,10000);
+</script></body></html>""")
 
     @app.get("/admin/nodes", include_in_schema=False)
     async def nodes_page() -> FileResponse:
