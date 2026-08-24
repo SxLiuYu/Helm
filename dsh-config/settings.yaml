@@ -1,0 +1,88 @@
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+llm-pi-ai:
+  providers:
+    pro:
+      apiKeyEnv: PRO_API_KEY
+      api: openai-completions
+      retryPolicy:
+        mode: normal
+        maxRetries: 50
+        backoff:
+          initialDelayMs: 1000
+          maxDelayMs: 30000
+          jitterRatio: 0.2
+      baseURL: https://www.finna.com.cn/v1
+      models:
+        - id: deepseek-v4-pro
+          name: deepseek-v4-pro
+    agnes:
+      apiKeyEnv: AGNES_API_KEY
+      api: openai-completions
+      retryPolicy:
+        mode: normal
+        maxRetries: 50
+        backoff:
+          initialDelayMs: 1000
+          maxDelayMs: 30000
+          jitterRatio: 0.2
+      baseURL: https://api.agnes-ai.cn/v1
+      models:
+        - id: agnes-2.0-flash
+        - id: agnes-2.5-flash
+    glm:
+      apiKeyEnv: GLM_API_KEY
+      api: openai-completions
+      retryPolicy:
+        mode: normal
+        maxRetries: 50
+        backoff:
+          initialDelayMs: 1000
+          maxDelayMs: 30000
+          jitterRatio: 0.2
+      baseURL: https://www.finna.com.cn/v1
+      models:
+        - id: glm-5.2
+    flash:
+      apiKeyEnv: FLASH_API_KEY
+      api: openai-completions
+      retryPolicy:
+        mode: normal
+        maxRetries: 50
+        backoff:
+          initialDelayMs: 1000
+          maxDelayMs: 30000
+          jitterRatio: 0.2
+      baseURL: https://www.finna.com.cn/v1
+      models:
+        - id: deepseek-v4-flash
+    damselfish:
+      apiKeyEnv: DAMSELFISH_API_KEY
+      api: openai-completions
+      retryPolicy:
+        mode: normal
+        maxRetries: 50
+        backoff:
+          initialDelayMs: 1000
+          maxDelayMs: 30000
+          jitterRatio: 0.2
+      baseURL: http://127.0.0.1:3086/v1
+      headers:
+        X-Damselfish-Scenario: coding
+        X-Damselfish-Persona: developer
+      models:
+        - id: damselfish/auto
+agent-default-model:
+  provider: damselfish
+  model: damselfish/auto
+permission:
+  defaultPreset: danger-full-access
+agent-presets:
+  default: banzhuan
+ui-conversation:
+  busyEnter: steer
+# Tavily 已替换为本地 SearXNG(127.0.0.1:8888)
+# agent 通过 web-research skill 用 curl 调 SearXNG JSON API
+dsh-better-sidebar:
+  tabsEnabled:
+    subagent: true

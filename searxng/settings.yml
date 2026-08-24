@@ -1,0 +1,130 @@
+general: {debug: false, instance_name: Helm SearXNG, privacypolicy_url: false, donation_url: false, contact_url: false, enable_metrics: true, open_metrics: ''}
+server:
+  port: 8888
+  bind_address: 127.0.0.1
+  base_url: false
+  limiter: false
+  public_instance: false
+  secret_key: f3abae48f9504166e48c7c885157ae1a1d883895a73d0babcf5a7fb3c6b0359c
+  image_proxy: false
+  http_protocol_version: '1.0'
+  method: GET
+  default_http_headers: {X-Content-Type-Options: nosniff, X-Download-Options: noopen, X-Robots-Tag: 'noindex, nofollow', Referrer-Policy: no-referrer}
+search:
+  safe_search: 0
+  autocomplete: duckduckgo
+  autocomplete_min: 4
+  favicon_resolver: ''
+  default_lang: zh-CN
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  suspended_times: {SearxEngineAccessDenied: 180, SearxEngineCaptcha: 3600, SearxEngineTooManyRequests: 180, cf_SearxEngineCaptcha: 1296000, cf_SearxEngineAccessDenied: 86400, recaptcha_SearxEngineCaptcha: 604800}
+  formats: [html, json]
+enabled_engines:
+- {name: 360search, engine: 360search}
+- {name: astrophysics data system, engine: astrophysics_data_system}
+- {name: ahmia, engine: ahmia}
+- {name: arch linux wiki, engine: archlinux}
+- {name: artic, engine: artic}
+- {name: arxiv, engine: arxiv}
+- {name: azure, engine: azure}
+- {name: bandcamp, engine: bandcamp}
+- {name: baidu, engine: baidu}
+- {name: baidu images, engine: baidu}
+- {name: baidu kaifa, engine: baidu}
+- {name: bing, engine: bing}
+- {name: bing images, engine: bing_images}
+- {name: bing news, engine: bing_news}
+- {name: bing videos, engine: bing_videos}
+- {name: openverse, engine: openverse}
+- {name: chefkoch, engine: chefkoch}
+- {name: cloudflareai, engine: cloudflareai}
+- {name: core.ac.uk, engine: core}
+- {name: currency, engine: currency_convert}
+- {name: deviantart, engine: deviantart}
+- {name: devicons, engine: devicons}
+- {name: docker hub, engine: docker_hub}
+- {name: elasticsearch, engine: elasticsearch}
+- {name: wikidata, engine: wikidata}
+- {name: dogpile, engine: dogpile}
+- {name: dogpile images, engine: dogpile}
+- {name: dogpile videos, engine: dogpile}
+- {name: dogpile news, engine: dogpile}
+- {name: duckduckgo videos, engine: duckduckgo_extra}
+- {name: duckduckgo news, engine: duckduckgo_extra}
+- {name: etymonline, engine: xpath}
+- {name: ebay, engine: ebay}
+- {name: flickr, engine: flickr_noapi}
+- {name: flickr_api, engine: flickr}
+- {name: freesound, engine: freesound}
+- {name: genius, engine: genius}
+- {name: gentoo, engine: mediawiki}
+- {name: github, engine: github}
+- {name: github code, engine: github_code}
+- {name: google cse, engine: google_cse}
+- {name: google cse images, engine: google_cse}
+- {name: google scholar, engine: google_scholar}
+- {name: hoogle, engine: xpath}
+- {name: jina, engine: jina}
+- {name: kickass, engine: kickass}
+- {name: lemmy communities, engine: lemmy}
+- {name: lemmy users, engine: lemmy}
+- {name: lemmy posts, engine: lemmy}
+- {name: lemmy comments, engine: lemmy}
+- {name: libretranslate, engine: libretranslate}
+- {name: lingva, engine: lingva}
+- {name: lucide, engine: lucide}
+- {name: mastodon users, engine: mastodon}
+- {name: mastodon hashtags, engine: mastodon}
+- {name: mdn, engine: json_engine}
+- {name: mixcloud, engine: mixcloud}
+- {name: mankier, engine: json_engine}
+- {name: openairedatasets, engine: json_engine}
+- {name: openairepublications, engine: json_engine}
+- {name: openstreetmap, engine: openstreetmap}
+- {name: pdbe, engine: pdbe}
+- {name: pexels, engine: pexels}
+- {name: photon, engine: photon}
+- {name: pinterest, engine: pinterest}
+- {name: piped, engine: piped}
+- {name: piped.music, engine: piped}
+- {name: piratebay, engine: piratebay}
+- {name: pubmed, engine: pubmed}
+- {name: pypi, engine: pypi}
+- {name: radio browser, engine: radio_browser}
+- {name: reuters, engine: reuters}
+- {name: sepiasearch, engine: sepiasearch}
+- {name: sogou, engine: sogou}
+- {name: soundcloud, engine: soundcloud}
+- {name: stackoverflow, engine: stackexchange}
+- {name: askubuntu, engine: stackexchange}
+- {name: superuser, engine: stackexchange}
+- {name: semantic scholar, engine: semantic_scholar}
+- {name: springer nature, engine: springer}
+- {name: solidtorrents, engine: solidtorrents}
+- {name: torch, engine: xpath}
+- {name: Torznab EZTV, engine: torznab}
+- {name: unsplash, engine: unsplash}
+- {name: yandex api, engine: yandex_api}
+- {name: yahoo news, engine: yahoo_news}
+- {name: youtube, engine: youtube_noapi}
+- {name: youtube_api, engine: youtube_api}
+- {name: dailymotion, engine: dailymotion}
+- {name: vimeo, engine: vimeo}
+- {name: wikinews, engine: mediawiki}
+- {name: wiktionary, engine: mediawiki}
+- {name: wikicommons.images, engine: wikicommons}
+- {name: wikicommons.videos, engine: wikicommons}
+- {name: wikicommons.audio, engine: wikicommons}
+- {name: wikicommons.files, engine: wikicommons}
+- {name: wolframalpha_api, engine: wolframalpha_api}
+- {name: dictzone, engine: dictzone}
+- {name: mymemory translated, engine: translated}
+- {name: deepl, engine: deepl}
+- {name: wordnik, engine: wordnik}
+- {name: tootfinder, engine: tootfinder}
+- {name: wallhaven, engine: wallhaven}
+- {name: wttr.in, engine: wttr}
+- {name: braveapi, engine: braveapi}
+- {name: exaapi, engine: exaapi}
+- {name: bt4g, engine: bt4g}

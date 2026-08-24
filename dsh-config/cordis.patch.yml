@@ -1,0 +1,11 @@
+# Helm 精简配置 — 只保留核心插件
+
+- id: better-sidebar
+  disabled: true
+
+- id: session-log-download
+  disabled: true
+
+# 禁用梁神模式(来自 dsh-web-ui-all 聚合),只留 banzhuan + helmsman + minimal
+- id: web-ui-liangshen
+  disabled: true

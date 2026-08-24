@@ -1,0 +1,4 @@
+# damselfish-link: injects a Damselfish dashboard link into DSH web navbar
+- insert:
+    - id: damselfish-link
+      name: damselfish-link

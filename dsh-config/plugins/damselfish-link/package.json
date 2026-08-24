@@ -1,0 +1,13 @@
+{
+  "name": "damselfish-link",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Injects a Damselfish dashboard link into the DSH web navigation bar via indexTaps",
+  "main": "lib/index.js",
+  "files": ["lib", "cordis.patch.yml"],
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  }
+}

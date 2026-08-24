@@ -1,0 +1,3 @@
+name: 舵手模式
+description: CEO 监督者——分解任务、委派员工(subagent)、质量门禁、停滞纠偏。不直接写代码，只编排。
+order: 5
