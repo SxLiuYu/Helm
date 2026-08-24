@@ -401,9 +401,35 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                     memory_enabled, transcript, project_id, project_title,
                     session_title, session_id,
                 )
+            # Response cache for non-streaming requests (same prompt returns
+            # cached result without hitting upstream). Use ORIGINAL incoming
+            # messages for the key so memory merge doesn't break cache hits.
+            cache_cfg = loaded.routing
+            if cache_cfg.cache_enabled:
+                cache_key = _cache_key({"messages": incoming, "model": payload.get("model","auto"), "tools": payload.get("tools",[])}, context)
+                cached = _cache_get(request.app.state, cache_key, cache_cfg.cache_ttl_seconds)
+                if cached is not None:
+                    headers = {
+                        "X-Damselfish-Target": cached["target_id"],
+                        "X-Damselfish-Model": cached["model"],
+                        "X-Damselfish-Latency-Ms": "0.0",
+                        "X-Damselfish-Scenario": context.scenario,
+                        "X-Damselfish-Cache": "HIT",
+                        "X-Damselfish-Project": project_id,
+                        "X-Damselfish-Memory-Sync": request.app.state.memory_sync.response_status(),
+                    }
+                    if session_id:
+                        headers["X-Damselfish-Session"] = session_id
+                    return JSONResponse(content=cached["body"], headers=headers)
             result = await request.app.state.router.complete(
                 payload, context, decision_session
             )
+            if cache_cfg.cache_enabled:
+                _cache_set(request.app.state, _cache_key({"messages": incoming, "model": payload.get("model","auto"), "tools": payload.get("tools",[])}, context), {
+                    "target_id": result.target.id,
+                    "model": result.target.model,
+                    "body": result.body,
+                }, cache_cfg.cache_max_entries)
         except NoTargetAvailable as error:
             return JSONResponse(
                 status_code=503,
@@ -476,6 +502,44 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
     return app
 
 
+
+
+def _cache_key(payload: dict[str, Any], context) -> str:
+    """Build a stable cache key from messages, model, scenario, persona."""
+    import hashlib
+    raw = json.dumps({
+        "messages": payload.get("messages", []),
+        "model": payload.get("model", "auto"),
+        "scenario": context.scenario,
+        "persona": context.persona,
+        "tools": payload.get("tools", []),
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_get(app_state, key: str, ttl_seconds: int):
+    """Return cached entry if not expired, else None."""
+    cache = getattr(app_state, "_response_cache", None)
+    if cache is None:
+        return None
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    if time.time() - entry["ts"] > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    return entry["data"]
+
+
+def _cache_set(app_state, key: str, data, max_entries: int):
+    """Store a cache entry, evicting oldest if over max_entries."""
+    if not hasattr(app_state, "_response_cache"):
+        app_state._response_cache = {}
+    cache = app_state._response_cache
+    if len(cache) >= max_entries:
+        oldest = min(cache, key=lambda k: cache[k]["ts"])
+        cache.pop(oldest, None)
+    cache[key] = {"ts": time.time(), "data": data}
 
 
 async def _compress_conversation(store, router, session_id, messages, keep):
