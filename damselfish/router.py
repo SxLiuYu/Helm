@@ -653,7 +653,7 @@ def _to_messages_request(request: dict[str, Any]) -> dict[str, Any]:
     chat_messages: list[dict[str, Any]] = []
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
+        content = msg.get("content")
         if role == "system":
             if isinstance(content, str):
                 system_parts.append(content)
@@ -661,8 +661,27 @@ def _to_messages_request(request: dict[str, Any]) -> dict[str, Any]:
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
                         system_parts.append(part.get("text", ""))
+        elif role == "tool":
+            # Messages API doesn't have a "tool" role. Convert tool results
+            # into user messages with the tool output as text.
+            tool_name = msg.get("name", "tool")
+            tool_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            chat_messages.append({
+                "role": "user",
+                "content": f"[Tool result: {tool_name}]\n{tool_content}",
+            })
+        elif role == "assistant" and msg.get("tool_calls"):
+            # Convert assistant tool_calls into text so the conversation
+            # history stays coherent for Messages API models.
+            parts: list[str] = []
+            if content:
+                parts.append(str(content))
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                parts.append(f"[Tool call: {fn.get('name', '?')}({fn.get('arguments', '')})]")
+            chat_messages.append({"role": "assistant", "content": "\n".join(parts) or "..."})
         else:
-            chat_messages.append({"role": role, "content": content})
+            chat_messages.append({"role": role, "content": content if content is not None else ""})
     result: dict[str, Any] = {
         "model": request.get("model"),
         "messages": chat_messages,
