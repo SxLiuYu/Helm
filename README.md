@@ -1,177 +1,99 @@
-# 千机 (Damselfish)
+# Helm
 
-Damselfish 是一个本地优先、OpenAI API 兼容的智能模型路由器。它把本地模型和多个免费云 API 组成动态模型池，根据任务能力、人物设定、实时延迟和错误率自动选择，并在 429、超时或服务错误时切换到下一个模型。
+> **Helm** = DeepSeek Harness（舵手）+ damselfish（领航）
+>
+> 借鉴英伟达 AVO（Agentic Variation Operators）的 Harness 工程思想：优秀的系统架构能极大释放模型潜力——AVO 把 Claude Opus 5 的能力从 30% 提升到 100%。
 
-## 已实现
+## 命名
 
-- `POST /v1/chat/completions` 和 `GET /v1/models`
-- 根据工具、编程、推理、创作、翻译、视觉场景匹配模型能力
-- 根据 system prompt 或请求参数识别人物设定
-- EWMA 延迟、历史失败率、优先级综合排序
-- 429/超时/5xx 自动回退和指数冷却熔断
-- 后台低频健康及延迟探测，可按模型关闭避免浪费额度
-- SQLite 持久化指标、路由决策和跨模型会话记忆
-- 项目化多会话记忆，同项目不同会话共享近期上下文
-- Git 不可变快照同步，多设备自动拉取、提交和推送
-- 非流式响应及 OpenAI SSE 兼容响应
-- `/health` 和 `/stats` 可观察端点
-- 带 Bearer Key 验证的云节点添加、测试和热更新管理页面
+Helm，舵手。DSH 当舵手（监督 + 工具 + 循环），damselfish 选最快的船（智能路由多模型）。
 
-## 快速启动
+## 架构
 
-```bash
-cd /Users/sxliuyu/repos/damselfish
-cp config.example.yml config.yml
-uv sync --extra test
-export AGNES_API_KEY='替换为新密钥'
-export ZHIPU_API_KEY='替换为新密钥'
-export FINNA_API_KEY='替换为新密钥'
-uv run damselfish --config config.yml
+```
+                          ┌─────────────────────────────────────┐
+                          │           DSH (Helm 舵手)            │
+                          │  3080 web · supervisor/subagent     │
+                          │  ctx.skills (43 Matt Pocock skills) │
+                          │  ctx.shell/fs/web/subprocess        │
+                          │  ctx.workflow · persona · goal      │
+                          └────────────────┬────────────────────┘
+                                           │ default provider
+                                           ▼
+                          ┌─────────────────────────────────────┐
+                          │      damselfish (领航, 8086)          │
+                          │  场景+人物+延迟+失败率 综合评分       │
+                          │  三阶段回退: 串行→竞速→兜底          │
+                          │  SQLite 记忆 · 熔断 · 健康检查       │
+                          └────────────────┬────────────────────┘
+                                           │ 智能路由
+              ┌──────────────┬─────────────┼─────────────┬──────────────┐
+              ▼              ▼             ▼             ▼              ▼
+         agnes (4)      finna (5)    stepfun (5)   image/video(7)   ...
 ```
 
-未设置密钥的云目标会自动退出候选池。本地 Qwen 默认地址是 `http://127.0.0.1:8080/v1`，模型 ID 应与该服务 `/v1/models` 返回值一致。不要把密钥写入 `config.yml` 或提交到 Git。
+## AVO 四思想 → Helm 对应
 
-## 调用
+| AVO 思想 | Helm 里对应什么 |
+|---|---|
+| **分层监督**（CEO 实时纠偏 + 高层决策） | DSH 的 supervisor/subagent（liangshen preset 两阶段 anchor + 工具编排）= 舵手；damselfish 选模型 = 选航向 |
+| **记忆管理**（短期 + 长期） | damselfish SQLite（decisions/memory_events/sessions/projects）+ DSH session/compaction |
+| **迭代反馈循环**（方案→执行→反馈→修正） | damselfish 三阶段回退（串行→竞速→兜底）+ 熔断恢复 + DSH tool loop |
+| **工具与环境集成**（丰富工具箱 + 统一抽象） | DSH 的 ctx.skills / ctx.shell / ctx.fs / ctx.web / ctx.subprocess + damselfish 的 21 模型池 |
 
-```bash
-curl -i http://127.0.0.1:8086/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'X-Damselfish-Project: basketball-live' \
-  -H 'X-Damselfish-Session: deploy-2026-07-18' \
-  -d '{
-    "model": "damselfish/auto",
-    "messages": [{"role":"user","content":"帮我分析并修复这个 Python 错误"}]
-  }'
+## 仓库结构
+
+```
+Helm/
+├── damselfish/              # 路由器本体（Python，从千机迁移来）
+│   ├── damselfish/          # 源码：router/selector/config/app/store
+│   ├── scripts/
+│   │   ├── start.sh         # 本地启动（source .env + uv run + PID + 日志）
+│   │   └── stop.sh          # 停止（按 8086 端口 taskkill /T 杀树）
+│   ├── config.yml           # 路由配置 + 21 个 target（gitignore 不入库）
+│   ├── .env                 # 19 个 API key（gitignore 不入库）
+│   └── README-LOCAL.md      # damselfish 本地部署细节
+├── dsh-integration/         # DSH 集成配置
+│   ├── damselfish.provider.yml    # 要 merge 进 ~/.dsh/settings.yaml 的 provider 段
+│   ├── damselfish.credentials.yaml # 要追加进 ~/.dsh/.credentials.yaml 的 key
+│   ├── autostart.bat        # 开机自启（复制到 Startup 文件夹）
+│   └── README.md            # DSH 接入步骤
+└── README.md                # 本文件（Helm 总览）
 ```
 
-响应头会显示实际选择：
+## 模型池（21 个 target）
 
-- `X-Damselfish-Target`
-- `X-Damselfish-Model`
-- `X-Damselfish-Latency-Ms`
-- `X-Damselfish-Scenario`
-- `X-Damselfish-Project`
-- `X-Damselfish-Session`
-- `X-Damselfish-Memory-Sync`
+**14 个 chat 类（参与路由）：**
+- agnes：agnes-2.5-flash / agnes-2.0-flash（apihub + api.agnes-ai.cn 两端点，共 4 个）
+- finna：glm-5.2、deepseek-v4-flash、deepseek-v4-pro、qwen3.6-plus、minimax-m2.7
+- stepfun：step-3.7-flash、step-router-v1、stepaudio-2.5-chat、step-3.5-flash-2603、step-3.5-flash
 
-同一个项目和会话的历史会存入 SQLite。即使请求从 Qwen 切换到 Agnes 或 GLM，新模型仍会收到同一份上下文。同项目其他会话的近期内容会作为共享项目记忆注入，但不会重复保存到当前会话。不传 session 时不保存服务端记忆。
+**7 个 image/video（在池不参与 chat 路由）：**
+- agnes-image-2.0-flash / 2.1-flash（+cn）、agnes-video-2.5 / v2.0（+cn）
+- 注：damselfish 当前是 chat completions router，不调 image/video endpoint；要真正用需扩展
 
-也可以在 JSON 中显式指定：
+## 快速部署
 
-```json
-{
-  "model": "damselfish/auto",
-  "damselfish": {
-    "project_id": "basketball-live",
-    "project_title": "篮球比赛数据直播系统",
-    "session_id": "cloud-deploy",
-    "session_title": "云端部署",
-    "persona": "developer",
-    "scenario": "coding",
-    "memory": true,
-    "project_memory": true
-  },
-  "messages": [{"role": "user", "content": "检查部署状态"}]
-}
-```
+见 `dsh-integration/README.md` 和 `damselfish/README-LOCAL.md`。核心三步：
 
-## 多端记忆同步
+1. **启动 damselfish**：`bash damselfish/scripts/start.sh`（8086）
+2. **接入 DSH**：merge `dsh-integration/damselfish.provider.yml` → `~/.dsh/settings.yaml`，追加 key → `~/.dsh/.credentials.yaml`，重启 DSH
+3. **开机自启**：复制 `dsh-integration/autostart.bat` 到启动文件夹
 
-推荐创建一个单独的 **GitHub 私有仓库** 保存记忆，不要和 Damselfish 源码仓库混用。会话可能包含代码、服务器信息和其他敏感数据，禁止使用公开仓库。
+## 安全
 
-在每台设备使用相同的记忆仓库，并设置不同设备 ID：
+- `.env` / `config.yml` / `managed-nodes.json` / `data/` 全部在 `.gitignore`，密钥不入库
+- damselfish 对 chat 请求做 HMAC key 校验（`Authorization: Bearer`）
+- DSH 有 `dsh-sandbox` + `fs/* policy hooks`（读不可信内容→执行敏感动作之间可加策略层）
 
-```bash
-export DAMSELFISH_MEMORY_GIT_URL='git@github.com:你的账号/damselfish-memory.git'
-export DAMSELFISH_DEVICE_ID='mac-mini'
-```
+## 状态
 
-然后在 `config.yml` 开启：
+- damselfish 路由器：完成，21 target 全 available，三阶段回退验证通过
+- DSH 集成：完成，default=damselfish，端到端验证通过（DSH → damselfish → 上游路由 + 503 回退）
+- 跨设备记忆：不做（两设备 memory db 各自独立）
 
-```yaml
-git_sync:
-  enabled: true
-  repository: ./data/memory-repo
-  branch: main
-  pull_interval_seconds: 30
-  push_on_write: true
-```
+## 致谢
 
-每轮对话会生成独立 JSON 快照，目录结构为：
-
-```text
-memory/projects/<project>/sessions/<session>/<timestamp>-<device>-<event>.json
-```
-
-请求前会按间隔拉取并导入远端快照；回答后会提交并推送当前会话。GitHub 或网络暂时失败时，对话仍正常返回，事件保留为 pending，后台会继续重试。可通过以下接口查看和手动同步：
-
-```bash
-curl http://127.0.0.1:8086/v1/memory/projects
-curl http://127.0.0.1:8086/v1/memory/projects/basketball-live/sessions
-curl -X POST http://127.0.0.1:8086/v1/memory/sync
-curl http://127.0.0.1:8086/health
-```
-
-认证建议使用 SSH deploy key，或仅授权记忆仓库 Contents 读写权限的 fine-grained GitHub PAT 配合 credential helper。不要把 token 放进 Git URL、YAML 或仓库。多设备尽量使用不同 `session_id`；同一会话同时编辑时，目前按消息更多、时间更新的快照优先合并。
-
-Git 适合个人低频协同、审计和备份，不适合高并发写入。未来扩展为多用户或多云实例时，应以 PostgreSQL 作为实时存储，以对象存储或 Git 作为归档层。
-
-## 云端部署
-
-服务器安装 Docker 后，创建 `config.yml`，将 `server.host` 设置为 `0.0.0.0`，开启 `git_sync`，然后通过环境变量注入密钥：
-
-```bash
-export DAMSELFISH_API_KEY='为客户端设置的路由访问密钥'
-export DAMSELFISH_MEMORY_GIT_URL='git@github.com:你的账号/damselfish-memory.git'
-export DAMSELFISH_DEVICE_ID='cloud-primary'
-export AGNES_API_KEY='云模型密钥'
-docker compose up -d --build
-docker compose logs -f damselfish
-```
-
-`compose.yml` 使用 Docker volume 持久化 `/app/data`，其中包含 SQLite 数据库和记忆 Git 工作区。若记忆仓库使用 SSH，在生产环境通过 Docker secret 或只读 volume 将 deploy key 与 `known_hosts` 挂载到容器用户 `/home/damselfish/.ssh`；不要把私钥复制进镜像。
-
-云端务必通过防火墙或 HTTPS 反向代理限制访问，并设置 `DAMSELFISH_API_KEY`。同一记忆仓库可被云端和多台客户端使用，但每台设备都应设置唯一的 `DAMSELFISH_DEVICE_ID`。
-
-## 调度规则
-
-1. 排除未配置密钥、已禁用和熔断中的目标。
-2. 排除不具备必需能力的目标，例如工具请求只进入带 `tools` 标签的模型。
-3. 用 EWMA 延迟、失败率、配置优先级、能力及人物匹配计算得分。
-4. 按得分从低到高调用；任一目标失败会在同一请求内自动尝试下一个。
-5. 后台探测更新空闲模型延迟，实际请求也持续更新评分。
-
-`priority` 越低越优先。若只想严格选择最快模型，可将目标的 `priority` 设成相同值。主动探测会产生少量 API 调用；额度敏感的模型应设置 `probe: false`。
-
-## Hermes 接入
-
-把 Hermes 的 OpenAI 兼容 provider 指向：
-
-```text
-base_url: http://127.0.0.1:8086/v1
-model: damselfish/auto
-api_key: 任意值（未设置 DAMSELFISH_API_KEY 时）
-```
-
-如果设置了 `DAMSELFISH_API_KEY`，Hermes 必须使用同一密钥。通过 `curl http://127.0.0.1:8086/stats` 可查看每次路由、延迟、熔断和错误。
-
-## 测试
-
-```bash
-uv sync --extra test
-uv run pytest
-```
-
-## 云节点管理页面
-
-部署后打开 `https://服务器/damselfish/admin/nodes`，输入服务器配置的
-`DAMSELFISH_API_KEY`，即可添加和测试 OpenAI 兼容云节点。管理 API 与模型 API
-使用相同的 Bearer Key 验证；上游 API Key 只写入服务器权限为 `0600` 的
-`managed-nodes.json`，列表和编辑接口不会回显密钥。
-
-页面支持获取上游模型列表、延迟测试、测试后保存、编辑和删除。每个已配置节点会
-展开显示其具体模型 ID、实际供应商、客户端接入地址、实际上游 Base URL、实际上游
-`/chat/completions` 请求地址以及请求体应填写的 `model` 值；`auto` 会单独标记为自动
-路由，并说明上游会在请求时动态选择。扩展上游元数据不可用时会兼容标准 OpenAI
-`/models` 响应并回退到节点地址。模型发现
-失败不会影响节点列表和节点管理。节点保存后会热更新模型池，无需重启 Damselfish。
+- damselfish（千机）路由器：基于作者 sxliuyu 原项目
+- DeepSeek Harness (DSH)：DeepSeek 官方 agent runtime
+- AVO 设计思想：NVIDIA《AVO: Agentic Variation Operators for Autonomous Evolutionary Search》

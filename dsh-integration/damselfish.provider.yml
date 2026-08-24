@@ -1,0 +1,15 @@
+# DSH settings.yaml 要加入的 damselfish provider 段
+# 把这段 merge 进 ~/.dsh/settings.yaml 的 llm-pi-ai.providers 下
+damselfish:
+  apiKeyEnv: DAMSELFISH_API_KEY
+  api: openai-completions
+  retryPolicy:
+    mode: normal
+    maxRetries: 50
+    backoff:
+      initialDelayMs: 1000
+      maxDelayMs: 30000
+      jitterRatio: 0.2
+  baseURL: http://127.0.0.1:8086/v1
+  models:
+    - id: damselfish/auto
