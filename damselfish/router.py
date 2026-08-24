@@ -388,9 +388,17 @@ class ModelRouter:
             # Cancel remaining tasks and close losing iterators
             for task in pending:
                 task.cancel()
+            # Wait for cancelled tasks to finish before closing their
+            # iterators, otherwise aclose() raises
+            # "RuntimeError: asynchronous generator is already running"
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             for t, it in iterators.items():
                 if t is not winner_target:
-                    await it.aclose()
+                    try:
+                        await it.aclose()
+                    except RuntimeError:
+                        pass
             return CompletionResult(
                 body={"choices": [{"message": {"content": ""}}]},
                 target=winner_target,

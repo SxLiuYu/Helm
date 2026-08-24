@@ -150,6 +150,10 @@ async function load(){
 load();setInterval(load,10000);
 </script></body></html>""")
 
+    @app.get("/health", include_in_schema=False)
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     @app.get("/stats")
     async def stats(request: Request) -> dict[str, Any]:
         states = request.app.state.store.all_stats()
