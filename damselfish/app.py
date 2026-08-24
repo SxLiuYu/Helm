@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -101,18 +102,18 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
 <title>Damselfish Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}
-h1{color:#4472C4;margin-bottom:16px;font-size:22px}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f5f7fa;color:#1a1a2e;padding:20px}
+h1{color:#2b5cb8;margin-bottom:16px;font-size:22px}
 .summary{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
-.card{background:#16213e;border-radius:10px;padding:14px 18px;min-width:120px}
-.card .num{font-size:28px;font-weight:700;color:#4472C4}
+.card{background:#fff;border:1px solid #e0e6ed;border-radius:10px;padding:14px 18px;min-width:120px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.card .num{font-size:28px;font-weight:700;color:#2b5cb8}
 .card .label{font-size:12px;color:#888;margin-top:2px}
-table{width:100%;border-collapse:collapse;background:#16213e;border-radius:10px;overflow:hidden}
-th{background:#0f3460;padding:10px 12px;text-align:left;font-size:12px;color:#8aa;text-transform:uppercase}
-td{padding:8px 12px;border-top:1px solid#1a1a3e;font-size:13px}
-.tr-ok{color:#4CAF50} .tr-fail{color:#f44336} .tr-na{color:#666}
-.bar{height:4px;border-radius:2px;background:#1a1a3e;margin-top:2px}
-.bar-fill{height:100%;border-radius:2px;background:#4472C4}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e0e6ed;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+th{background:#eef2f7;padding:10px 12px;text-align:left;font-size:12px;color:#5a6a7a;text-transform:uppercase}
+td{padding:8px 12px;border-top:1px solid#eef2f7;font-size:13px}
+.tr-ok{color:#2e7d32} .tr-fail{color:#c62828} .tr-na{color:#999}
+.bar{height:4px;border-radius:2px;background:#eef2f7;margin-top:2px}
+.bar-fill{height:100%;border-radius:2px;background:#2b5cb8}
 </style></head><body>
 <h1>🐟 Damselfish Dashboard</h1>
 <div class="summary" id="summary"></div>
@@ -138,9 +139,9 @@ async function load(){
     <tr>
       <td>${t.target_id}</td>
       <td class="${t.available?'tr-ok':'tr-na'}">${t.available?'✅':'❌'}</td>
-      <td><span title="智能分数 ${t.intelligence||'-'}/100" style="color:#4472C4;font-weight:600">${t.intelligence||'-'}</span></td>
-      <td style="color:#8aa">${t.priority??'-'}</td>
-      <td style="color:${t.free?'#4CAF50':'#ff9800'}">${t.free?'免费':'付费'}</td>
+      <td><span title="智能分数 ${t.intelligence||'-'}/100" style="color:#2b5cb8;font-weight:600">${t.intelligence||'-'}</span></td>
+      <td style="color:#5a6a7a">${t.priority??'-'}</td>
+      <td style="color:${t.free?'#2e7d32':'#e65100'}">${t.free?'免费':'付费'}</td>
       <td class="${t.requests>0?(t.failures>0?'tr-fail':'tr-ok'):'tr-na'}" title="${t.successes}/${t.requests}">${t.requests>0?(t.successes/t.requests*100).toFixed(1)+'%':'-'}</td>
       <td>${t.total_tokens>1e6?(t.total_tokens/1e6).toFixed(1)+'M':t.total_tokens}</td>
       <td>${t.ewma_latency_ms?t.ewma_latency_ms.toFixed(0):'-'}</td>
@@ -215,10 +216,10 @@ load();setInterval(load,10000);
         session_id = _identifier(
             x_damselfish_session or extension.get("session_id"), "session_id", optional=True
         )
-        project_id = _identifier(
-            x_damselfish_project or extension.get("project_id") or "default",
-            "project_id",
-        )
+        raw_project = x_damselfish_project or extension.get("project_id")
+        if not raw_project:
+            raw_project = _infer_project_id(payload.get("messages", []))
+        project_id = _identifier(raw_project or "default", "project_id")
         if not session_id:
             session_id = _derive_session_id(payload.get("messages", []))
         project_title = _title(
@@ -603,6 +604,27 @@ async def _handle_streaming(
 # ------------------------------------------------------------------ #
 # Helpers
 # ------------------------------------------------------------------ #
+def _infer_project_id(messages: list[dict[str, Any]]) -> str | None:
+    """Infer project_id from the working directory in the system prompt.
+
+    DSH (and other agentic clients) include ``Your working directory is
+    /path/to/project`` in the system prompt.  Extract the last path segment
+    so sessions from different projects are isolated in memory even when
+    the client doesn't send X-Damselfish-Project headers.
+    """
+    for msg in messages[:3]:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        m = re.search(r"[Ww]orking directory is (/[\S]+)", content)
+        if m:
+            path = m.group(1).rstrip("/.,;:")
+            return path.rsplit("/", 1)[-1] or None
+    return None
+
+
 def _derive_session_id(messages: list[dict[str, Any]]) -> str | None:
     """Derive a stable session id from the first user message.
 
