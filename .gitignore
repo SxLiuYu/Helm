@@ -4,6 +4,7 @@
 .DS_Store
 .venv/
 /config.yml
+/config.yml.pre-*
 __pycache__/
 .pytest_cache/
 *.egg-info/

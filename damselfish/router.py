@@ -431,6 +431,8 @@ class ModelRouter:
         request, capped = _upstream_payload(payload, target, probe)
         if capped:
             self.store.record_cap(target.id)
+        if target.api_format == "messages":
+            request = _to_messages_request(request)
         headers = {"Content-Type": "application/json"}
         if target.api_key:
             headers["Authorization"] = f"Bearer {target.api_key}"
@@ -448,6 +450,8 @@ class ModelRouter:
             body = response.json()
             if isinstance(body.get("data"), dict) and "choices" in body["data"]:
                 body = body["data"]
+            if target.api_format == "messages":
+                body = _from_messages_response(body, target.model)
             _validate_completion(body)
         except UpstreamFailure as error:
             self._record_failure(target, error.status, str(error), probe)
@@ -483,6 +487,8 @@ class ModelRouter:
         request, capped = _upstream_payload(payload, target, probe)
         if capped:
             self.store.record_cap(target.id)
+        if target.api_format == "messages":
+            request = _to_messages_request(request)
         request["stream"] = True
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if target.api_key:
@@ -503,6 +509,8 @@ class ModelRouter:
             json_response = "application/json" in content_type or response.content.lstrip().startswith(b"{")
             if "text/event-stream" not in content_type and json_response:
                 body = response.json()
+                if target.api_format == "messages":
+                    body = _from_messages_response(body, target.model)
                 if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
                     raise ValueError("non-streaming upstream response has no choices")
                 normalized = _normalize_stream_chunk(body, target.model)
@@ -527,8 +535,21 @@ class ModelRouter:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                normalized = _normalize_stream_chunk(chunk, target.model)
-                usage = chunk.get("usage") if not probe else None
+                if target.api_format == "messages":
+                    normalized = _from_messages_stream_event(chunk, target.model)
+                    if normalized is None:
+                        continue
+                    usage = None
+                    if chunk.get("type") == "message_delta":
+                        u = chunk.get("usage", {})
+                        usage = {
+                            "prompt_tokens": int(u.get("input_tokens", 0) or 0),
+                            "completion_tokens": int(u.get("output_tokens", 0) or 0),
+                            "total_tokens": int(u.get("input_tokens", 0) or 0) + int(u.get("output_tokens", 0) or 0),
+                        } if u else None
+                else:
+                    normalized = _normalize_stream_chunk(chunk, target.model)
+                    usage = chunk.get("usage") if not probe else None
                 if not _first_yielded:
                     _first_yielded = True
                     self.store.record_success(
@@ -538,7 +559,6 @@ class ModelRouter:
                         total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                     )
                 elif isinstance(usage, dict):
-                    # Subsequent chunk with usage (some providers send it on the last chunk)
                     self.store.record_usage(
                         target.id,
                         prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
@@ -624,6 +644,150 @@ class ModelRouter:
                 )
             except TimeoutError:
                 pass
+
+
+def _to_messages_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Convert a Chat Completions request to Messages API (/v1/messages) format."""
+    messages = request.get("messages", [])
+    system_parts: list[str] = []
+    chat_messages: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        system_parts.append(part.get("text", ""))
+        else:
+            chat_messages.append({"role": role, "content": content})
+    result: dict[str, Any] = {
+        "model": request.get("model"),
+        "messages": chat_messages,
+        "max_tokens": request.get("max_tokens", request.get("max_completion_tokens", 4096)),
+    }
+    if system_parts:
+        result["system"] = "\n\n".join(system_parts)
+    if "temperature" in request:
+        result["temperature"] = request["temperature"]
+    if "top_p" in request:
+        result["top_p"] = request["top_p"]
+    stop = request.get("stop")
+    if stop:
+        result["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+    if request.get("stream"):
+        result["stream"] = True
+    return result
+
+
+_MESSAGES_FINISH_MAP = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+}
+
+
+def _from_messages_response(body: dict[str, Any], model: str) -> dict[str, Any]:
+    """Convert a Messages API response to Chat Completions format."""
+    text = ""
+    thinking = ""
+    for block in body.get("content", []):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text += block.get("text", "")
+        elif btype == "thinking":
+            thinking += block.get("thinking", "")
+    stop_reason = body.get("stop_reason", "end_turn")
+    finish_reason = _MESSAGES_FINISH_MAP.get(stop_reason, stop_reason)
+    usage = body.get("usage", {})
+    input_tokens = int(usage.get("input_tokens", 0) or 0)
+    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    message: dict[str, Any] = {"role": "assistant", "content": text}
+    if thinking:
+        message["reasoning_content"] = thinking
+    return {
+        "id": body.get("id", ""),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+    }
+
+
+def _from_messages_stream_event(data: dict[str, Any], model: str) -> dict[str, Any] | None:
+    """Convert a Messages API SSE event to an OpenAI chat.completion.chunk.
+
+    Returns None for events with no OpenAI equivalent (message_start,
+    content_block_start, content_block_stop, message_stop).
+    """
+    event_type = data.get("type", "")
+    if event_type == "content_block_delta":
+        delta = data.get("delta", {})
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            return {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": delta.get("text", "")},
+                    "finish_reason": None,
+                }],
+            }
+        if dtype == "thinking_delta":
+            return {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"reasoning_content": delta.get("thinking", "")},
+                    "finish_reason": None,
+                }],
+            }
+        return None
+    if event_type == "message_delta":
+        delta = data.get("delta", {})
+        stop_reason = delta.get("stop_reason")
+        finish_reason = _MESSAGES_FINISH_MAP.get(stop_reason, stop_reason) if stop_reason else None
+        usage = data.get("usage", {})
+        chunk: dict[str, Any] = {
+            "id": "",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+        }
+        if usage:
+            input_tokens = int(usage.get("input_tokens", 0) or 0)
+            output_tokens = int(usage.get("output_tokens", 0) or 0)
+            chunk["usage"] = {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            }
+        return chunk
+    return None
 
 
 UPSTREAM_FIELDS = {

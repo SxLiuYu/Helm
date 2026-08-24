@@ -28,11 +28,14 @@ class TargetConfig:
     max_concurrency: int = 4
     max_context: int | None = None
     intelligence: int = 50
+    api_format: str = "chat"
     api_key_value: str = field(default="", repr=False, compare=False)
 
     @property
     def chat_url(self) -> str:
         url = self.base_url.rstrip("/")
+        if self.api_format == "messages":
+            return url if url.endswith("/messages") else f"{url}/messages"
         return url if url.endswith("/chat/completions") else f"{url}/chat/completions"
 
     @property
@@ -165,6 +168,7 @@ def target_from_mapping(item: dict[str, Any], *, managed: bool = False) -> Targe
         max_concurrency=max(int(item.get("max_concurrency", 4)), 1),
         max_context=int(item["max_context"]) if item.get("max_context") else None,
         intelligence=int(item.get("intelligence", 50)),
+        api_format=str(item.get("api_format", "chat")),
         api_key_value=str(item.get("api_key", "")) if managed else "",
     )
 
