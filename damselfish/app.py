@@ -617,6 +617,31 @@ async def _handle_streaming(
             }
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
             return
+        # Emit a final chunk with usage + finish_reason so downstream
+        # consumers (e.g. DSH token-meter) can compute tok/s. Most upstream
+        # providers do not include usage in streaming chunks, so estimate
+        # from accumulated content and the request messages.
+        from .tokens import estimate_text_tokens, estimate_messages_tokens
+        full_content = "".join(accumulated_content)
+        completion_tokens = estimate_text_tokens(full_content)
+        prompt_tokens = estimate_messages_tokens(payload.get("messages", []))
+        final_chunk = {
+            "id": "",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": target_model or "damselfish/auto",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+        yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         # Save memory after stream ends
         result = getattr(router, "_stream_result", None)

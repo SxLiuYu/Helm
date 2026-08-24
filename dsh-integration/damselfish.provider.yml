@@ -10,6 +10,6 @@ damselfish:
       initialDelayMs: 1000
       maxDelayMs: 30000
       jitterRatio: 0.2
-  baseURL: http://127.0.0.1:8086/v1
+  baseURL: http://127.0.0.1:3086/v1
   models:
     - id: damselfish/auto

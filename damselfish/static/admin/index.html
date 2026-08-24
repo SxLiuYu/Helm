@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <base href="/admin/">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Damselfish 管理台</title>
+  <link rel="stylesheet" href="css/admin.css">
+  <!-- fe-eng 的页面样式：允许暂缺，404 不影响壳启动 -->
+  <link rel="stylesheet" href="css/pages.css">
+</head>
+<body>
+<div class="layout" x-data>
+  <!-- ===== 侧栏（220px ↔ 64px 折叠） ===== -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5L13 2Z"/></svg><span class="label">Damselfish</span></div>
+    <nav class="nav">
+      <a href="#/dashboard" data-nav="dashboard" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 16.5 7"/><path d="M3.3 17a9 9 0 1 1 17.4 0"/><path d="M12 14a2 2 0 1 0 0 .01"/></svg><span class="label">仪表盘</span></a>
+      <a href="#/nodes" data-nav="nodes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="label">服务器</span></a>
+      <a href="#/memory" data-nav="memory"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5.5" rx="8" ry="2.8"/><path d="M4 5.5v6c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8v-6"/><path d="M4 11.5v6c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8v-6"/></svg><span class="label">数据库</span></a>
+      <a href="#/settings" data-nav="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.36a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.64 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09c0 .68.4 1.29 1.03 1.56a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.27.63.88 1.03 1.56 1.03H21a2 2 0 1 1 0 4h-.09c-.68 0-1.29.4-1.51.97Z"/></svg><span class="label">设置</span></a>
+    </nav>
+    <button class="collapse-btn" id="collapseBtn" title="折叠侧栏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m14 7-5 5 5 5"/></svg></button>
+  </aside>
+
+  <!-- ===== 主区 ===== -->
+  <div class="main">
+    <header class="topbar">
+      <h1 id="pageTitle">用量看板</h1>
+      <div class="topbar-right">
+        <span class="degraded-badge" id="degradedBadge" hidden>实时已降级 · 轮询中</span>
+        <span class="health" id="healthWrap" title="服务健康状态"><span class="dot" id="healthDot"></span><span class="label">健康</span></span>
+        <label class="win-label">窗口
+          <select id="windowSelect">
+            <option value="3600">近1小时</option>
+            <option value="86400" selected>近24小时</option>
+            <option value="604800">近7天</option>
+            <option value="0">全部</option>
+          </select>
+        </label>
+        <label class="auto-label"><input type="checkbox" id="autoToggle" checked>自动刷新</label>
+      </div>
+    </header>
+    <main id="view" class="view"><div class="loading-page">正在加载…</div></main>
+  </div>
+</div>
+
+<!-- ===== 登录遮罩（401 或未登录时显示，成功后销毁） ===== -->
+<div class="login-overlay" id="loginOverlay" hidden>
+  <form class="login-card" id="loginForm">
+    <div class="login-brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5L13 2Z"/></svg>Damselfish 管理台</div>
+    <p class="login-hint">输入访问 Key 登录（POST /admin/login，12 小时 Cookie 会话）</p>
+    <input type="password" id="loginKey" autocomplete="current-password" placeholder="访问 Key" required>
+    <div class="login-error" id="loginError"></div>
+    <button type="submit" id="loginSubmit">登录</button>
+  </form>
+</div>
+
+<!-- vendor 与模块脚本：defer 保证顺序；fe-eng 的两个页面与 pages.css 允许暂缺 -->
+<script defer src="vendor/echarts.min.js"></script>
+<script defer src="js/app.js"></script>
+<script defer src="js/pages/dashboard.js"></script>
+<!-- fe-eng 并行开发中，暂缺不影响壳启动（各 js 容错注册） -->
+<script defer src="js/pages/target-detail.js"></script>
+<script defer src="js/pages/nodes.js"></script>
+<script defer src="vendor/alpine.min.js"></script>
+</body>
+</html>

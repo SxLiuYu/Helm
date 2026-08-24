@@ -27,6 +27,7 @@ class TargetConfig:
     probe_prompt: str = "Reply OK"
     max_concurrency: int = 4
     max_context: int | None = None
+    intelligence: int = 50
     api_key_value: str = field(default="", repr=False, compare=False)
 
     @property
@@ -50,6 +51,8 @@ class RouteRule:
     required: frozenset[str] = frozenset()
     preferred: frozenset[str] = frozenset()
     targets: tuple[str, ...] = ()
+    min_quality: int = 0
+    quality_weight: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +85,11 @@ class RoutingConfig:
     memory_compression_keep: int = 10
     parallel_fallback_count: int = 3
     parallel_fallback_timeout_seconds: float = 30.0
+    cache_enabled: bool = False
+    cache_ttl_seconds: int = 3600
+    cache_max_entries: int = 512
+    guardrail_min_content_length: int = 1
+    daily_usage_token_limit: int = 2000000
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +141,8 @@ def _route_rule(raw: dict[str, Any]) -> RouteRule:
         required=_set(raw.get("required")),
         preferred=_set(raw.get("preferred")),
         targets=_tuple(raw.get("targets")),
+        min_quality=int(raw.get("min_quality", 0)),
+        quality_weight=float(raw.get("quality_weight", 1.0)),
     )
 
 
@@ -154,6 +164,7 @@ def target_from_mapping(item: dict[str, Any], *, managed: bool = False) -> Targe
         probe_prompt=str(item.get("probe_prompt", "Reply OK")),
         max_concurrency=max(int(item.get("max_concurrency", 4)), 1),
         max_context=int(item["max_context"]) if item.get("max_context") else None,
+        intelligence=int(item.get("intelligence", 50)),
         api_key_value=str(item.get("api_key", "")) if managed else "",
     )
 

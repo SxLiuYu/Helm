@@ -5,22 +5,43 @@ server:
 database: ./data/damselfish.db
 
 routing:
-  request_timeout_seconds: 120
-  connect_timeout_seconds: 10
-  probe_interval_seconds: 180
-  probe_stale_seconds: 120
-  ewma_alpha: 0.35
-  unknown_latency_ms: 1500
-  failure_penalty_ms: 2000
-  priority_weight_ms: 10
-  circuit_failures: 2
-  circuit_base_seconds: 30
-  circuit_max_seconds: 900
-  memory_max_messages: 40
-  memory_ttl_days: 30
-  project_memory_session_limit: 3
-  project_memory_message_limit: 6
-  project_memory_max_chars: 12000
+  request_timeout_seconds: 120      # 单次上游请求超时
+  connect_timeout_seconds: 10       # TCP 连接超时
+  probe_interval_seconds: 180       # 后台探测间隔
+  probe_stale_seconds: 120          # 延迟数据超过该秒数视为过期
+  ewma_alpha: 0.35                  # EWMA 延迟平滑系数
+  unknown_latency_ms: 1500          # 无历史数据时的假设延迟
+  failure_penalty_ms: 2000          # 失败率惩罚（乘以失败率）
+  priority_weight_ms: 10            # priority 每差 1 级的权重
+  quality_weight_ms: 8              # 智能分（intelligence）每点抵扣的等效毫秒数；设为 0 可关闭智能分路由
+  key_rotation: sticky              # 多 Key 轮换策略：sticky 粘性优先（默认）/ round_robin 轮询均摊
+  key_probe_minutes: 10             # 失败 Key 冷却起步分钟数：401/429 后指数翻倍，上限 60 分钟自动回探
+  circuit_failures: 2              # 触发熔断的连续失败次数
+  circuit_base_seconds: 30         # 熔断基础时长
+  circuit_max_seconds: 900         # 熔断上限时长
+  memory_max_messages: 40           # 单会话保留消息上限
+  memory_ttl_days: 30              # 会话过期天数
+  project_memory_session_limit: 3   # 项目记忆拉取的相邻会话数
+  project_memory_message_limit: 6   # 每个相邻会话取最后 N 条
+  project_memory_max_chars: 12000   # 项目记忆注入最大字符数
+  memory_compression_threshold: 30 # 超过该消息数触发后台压缩
+  memory_compression_keep: 10       # 压缩后保留的近期消息数
+  parallel_fallback_count: 3        # 并行竞速的目标数
+  parallel_fallback_timeout_seconds: 30
+  auto_disable_consecutive_failures: 10  # 连续失败达到该值自动禁用
+  health_check_interval_seconds: 60 # 健康检查（自动恢复）间隔
+  # usage_cost_per_1m_tokens:       # 可选：每百万 token 成本（美元）
+  #   agnes-2.5-flash: 0.0
+  # daily_usage_token_limit: 1000000  # 可选：每日 token 配额上限
+  # Response cache for non-streaming requests (identical prompts return
+  # cached results without hitting upstream). Disabled by default.
+  # cache_enabled: true
+  # cache_ttl_seconds: 86400.0
+  # cache_max_entries: 256
+  # Post-response guardrail: reject 200 responses whose text content is
+  # shorter than this many characters (triggers fallback to next target).
+  # 0 disables the guardrail.
+  # guardrail_min_content_length: 0
 
 git_sync:
   enabled: false
@@ -33,6 +54,19 @@ git_sync:
   author_name: Damselfish Memory
   author_email: damselfish@localhost
   device_id_env: DAMSELFISH_DEVICE_ID
+
+# 跨设备 REST 云端记忆同步（与 git_sync 二选一或共用）
+cloud_memory:
+  enabled: false
+  url: ""                 # 远程 Damselfish 实例地址，如 https://example.com/damselfish
+  api_key: ""             # 远程服务器 API key（与 DAMSELFISH_API_KEY 一致）
+  api_key_env: ""         # 或通过环境变量注入
+  push_interval: 30        # 本地推送到云端间隔（秒）
+  pull_interval: 30        # 从云端拉取新事件间隔（秒）
+  device_id_env: DAMSELFISH_DEVICE_ID
+  batch_size: 100
+  max_snapshot_chars: 50000
+  mode: push_pull          # push_only / pull_only / push_pull
 
 scenarios:
   default:
@@ -51,6 +85,13 @@ scenarios:
     preferred: [multilingual, fast]
   vision:
     required: [vision]
+  # 审查场景：只允许 intelligence >= min_quality 的模型参与（配合 providers
+  # 里标注的智能分），quality_weight 提高智能分在评分中的权重。
+  review:
+    required: [coding]
+    preferred: [reasoning]
+    min_quality: 80
+    quality_weight: 2.5
 
 personas:
   developer:
@@ -62,6 +103,78 @@ personas:
   writer:
     keywords: ["作家", "文案", "writer"]
     preferred: [creative, multilingual]
+
+# ── Provider 可插拔配置 ──────────────────────────────────────────────
+# 同一供应商的多个模型只需写一次 base_url / api_key_env 等公共属性，
+# 每个 models 条目展开成一个平铺 target；条目可覆盖任意继承字段
+# （label/id/enabled/api_key_env/free/priority/capabilities/scenarios/
+#  personas/probe/probe_prompt/max_concurrency/max_context/intelligence/
+#  local/headers）。
+#
+# intelligence 是模型智能分（0-100，越高越聪明，参考排行榜主观标定，
+# 可自行调整）：路由评分按 quality_weight_ms 抵扣等效延迟，配合场景的
+# min_quality 可以把低分模型挡在门槛之外。目标 id 未显式给出时自动派生为
+# "{provider_id}-{model 小写 slug}"；显式 id 需匹配 ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$。
+providers:
+  # StepFun 订阅：响应速度一般，建议关闭主动探测以节省额度。
+  stepfun:
+    label: StepFun 订阅
+    base_url: https://api.stepfun.com/v1
+    api_key_env: STEPFUN_API_KEY
+    free: false
+    priority: 80
+    probe: false                      # 订阅额度敏感，建议 false
+    capabilities: [chat, chinese, tools, coding, reasoning]
+    models:
+      - model: step-2-16k             # 智能分参考：step 系列 ≈65-75
+        id: stepfun-step-2-16k
+        intelligence: 72
+      - model: step-1v-8k
+        id: stepfun-step-1v-8k
+        intelligence: 65
+
+  # Finna 公司平台：免费多模型，原平铺 finna 目标迁移为 providers 写法。
+  # 注意保留原有显式 id（finna-glm-5.2 等），历史统计数据才不会断。
+  finna:
+    label: Finna 平台
+    base_url: https://www.finna.com.cn/v1
+    api_key_env: FINNA_API_KEY
+    free: true
+    priority: 50
+    probe: false
+    # weight: 3                      # 可选：同优先级目标的加权负载均衡权重（默认1）
+    # override_params:               # 可选：覆盖发往上游的请求参数
+    #   temperature: 0.0
+    #   max_tokens: 500
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning]
+    models:
+      - model: glm-5.2                # 智能分参考 ≈85
+        id: finna-glm-5.2
+        label: Finna GLM-5.2
+        intelligence: 85
+      # 多 Key 轮换演示：同一模型绑定多把 key（多账号摊限额）。
+      # api_key_env 接受字符串或字符串列表；401/429 时自动切下一把重试，
+      # 失败 key 按 routing.key_probe_minutes 起步指数冷却、60 分钟封顶回探。
+      - model: kimi-k2.6              # 智能分参考 ≈82
+        id: finna-kimi-k2.6
+        label: Finna Kimi K2.6
+        api_key_env: [FINNA_KIMI_1, FINNA_KIMI_2]
+        intelligence: 82
+
+  # OpenRouter 免费通道：需要自定义请求头标识调用方，模型 id 形如
+  # "厂商/模型名:free"，自动派生的目标 id 会把 '/' ':' 等字符折叠成 '-'。
+  openrouter:
+    label: OpenRouter Free
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    headers:                          # 发往该 provider 所有请求的自定义头
+      HTTP-Referer: https://your-app.example.com
+      X-Title: Damselfish
+    models:
+      - model: deepseek/deepseek-chat-v3.1:free   # 免费小模型智能分参考 ≈40-60
+        intelligence: 55
+      - model: qwen/qwen3-8b:free
+        intelligence: 45
 
 targets:
   - id: local-qwen3-8b
@@ -75,7 +188,9 @@ targets:
     scenarios: [default, coding, tool]
     personas: [developer, operator]
     probe: true
+    probe_prompt: "Reply OK"
     max_concurrency: 2
+    # max_context: 32768  # 可选：设置后自动裁剪 max_tokens 防止上下文溢出
 
   - id: agnes-2.5-flash
     label: Agnes 2.5 Flash
@@ -84,18 +199,8 @@ targets:
     api_key_env: AGNES_API_KEY
     free: true
     priority: 20
-    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative, fast]
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative, fast, vision]
     probe: true
-
-  - id: agnes-2.0-flash
-    label: Agnes 2.0 Flash
-    base_url: https://apihub.agnes-ai.com/v1
-    model: agnes-2.0-flash
-    api_key_env: AGNES_API_KEY
-    free: true
-    priority: 30
-    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative, fast]
-    probe: false
 
   - id: glm-4.7-flash
     label: GLM 4.7 Flash
@@ -106,13 +211,3 @@ targets:
     priority: 40
     capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative]
     probe: true
-
-  - id: deepseek-v4-pro
-    label: DeepSeek V4 Pro
-    base_url: https://www.finna.com.cn/v1
-    model: deepseek-v4-pro
-    api_key_env: FINNA_API_KEY
-    free: true
-    priority: 50
-    capabilities: [chat, chinese, multilingual, tools, coding, reasoning]
-    probe: false

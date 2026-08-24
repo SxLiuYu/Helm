@@ -124,6 +124,9 @@ def rank_targets(
             score -= 250.0
         if target.id in context.preferred_targets:
             score -= 500.0 - context.preferred_targets.index(target.id) * 25.0
+        # Intelligence bonus/penalty relative to baseline 50.
+        # Higher intelligence reduces score (ranks higher); lower increases it.
+        score -= (target.intelligence - 50) * 8.0
         if requested_model and requested_model not in {"auto", "damselfish", "damselfish/auto"}:
             if requested_model in {target.id, target.model}:
                 score -= 10000.0
@@ -137,6 +140,20 @@ def rank_targets(
             score += random.uniform(0, 50.0) if state.successes > 500 else 0.0
         ranked.append((score, target))
     ranked.sort(key=lambda item: (item[0], item[1].id))
+    # Apply scenario quality gate: when min_quality > 0, drop targets whose
+    # effective quality proxy does not meet the threshold.
+    scenario_rule = config.scenarios.get(context.scenario)
+    min_quality = int(scenario_rule.min_quality) if scenario_rule and scenario_rule.min_quality else 0
+    if min_quality > 0:
+        quality_weight = float(scenario_rule.quality_weight) if scenario_rule and scenario_rule.quality_weight else 1.0
+        # Normalize score into a 0-100 quality proxy for filtering.
+        # Lower score = better target. Map to [0, 100] with 100 = best.
+        max_expected = max(2000.0, config.routing.unknown_latency_ms + config.routing.failure_penalty_ms + 1000.0)
+        ranked = [
+            (score, target)
+            for score, target in ranked
+            if max(0.0, min(100.0, (1.0 - (score + 10000.0) / (max_expected + 10000.0)) * 100.0)) >= min_quality * quality_weight
+        ]
     return [target for _, target in ranked]
 
 
