@@ -11,5 +11,8 @@ damselfish:
       maxDelayMs: 30000
       jitterRatio: 0.2
   baseURL: http://127.0.0.1:3086/v1
+  headers:
+    X-Damselfish-Scenario: coding
+    X-Damselfish-Persona: developer
   models:
     - id: damselfish/auto

@@ -352,6 +352,12 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         )
         scenario = x_damselfish_scenario or extension.get("scenario")
         persona = x_damselfish_persona or extension.get("persona")
+        # Request headers/extension are DEFAULT hints; content inference
+        # (system prompt keywords, tools, image presence) takes priority so
+        # CEO-delegated subagents get the right persona/scenario from their
+        # system prompt rather than the static provider header default.
+        header_scenario = scenario
+        header_persona = persona
         memory_enabled = bool(extension.get("memory", True)) and bool(session_id)
         project_memory_enabled = bool(extension.get("project_memory", True))
         incoming = payload["messages"]
@@ -377,9 +383,15 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                 if context_message:
                     payload["messages"] = [context_message, *transcript]
 
+        # Content inference from the ORIGINAL incoming messages (before memory
+        # merge) so memory history doesn't pollute persona/scenario detection.
         context = infer_context(
-            loaded, payload["messages"], payload.get("tools"), scenario, persona
+            loaded, incoming, payload.get("tools"), None, None
         )
+        if header_persona and not context.persona:
+            context = replace(context, persona=header_persona.lower())
+        if header_scenario and context.scenario == "default":
+            context = replace(context, scenario=header_scenario.lower())
         wants_stream = bool(payload.get("stream"))
         try:
             decision_session = f"{project_id}/{session_id}" if session_id else None
