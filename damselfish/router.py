@@ -679,6 +679,17 @@ def _to_messages_request(request: dict[str, Any]) -> dict[str, Any]:
         result["stop_sequences"] = stop if isinstance(stop, list) else [stop]
     if request.get("stream"):
         result["stream"] = True
+    # Strip Chat Completions-only fields that Messages API doesn't support
+    result.pop("tools", None)
+    result.pop("tool_choice", None)
+    result.pop("response_format", None)
+    result.pop("seed", None)
+    result.pop("presence_penalty", None)
+    result.pop("frequency_penalty", None)
+    result.pop("parallel_tool_calls", None)
+    result.pop("n", None)
+    result.pop("user", None)
+    result.pop("max_completion_tokens", None)
     return result
 
 
