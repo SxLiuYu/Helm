@@ -17,20 +17,27 @@ DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
 POLL_INTERVAL=2
 
 in_flight() {
-  curl -fsS --max-time 5 "$STATS_URL" 2>/dev/null | python3 -c '
+  # Returns -1 on any fetch/parse failure so a transient /stats error never
+  # kills this script under set -e; caller keeps polling until timeout.
+  local out
+  if out="$(curl -fsS --max-time 5 "$STATS_URL" 2>/dev/null | python3 -c '
 import json, sys
 try:
     print(int(json.load(sys.stdin).get("in_flight", 0)))
 except Exception:
     print(-1)
-'
+' 2>/dev/null)" && [ -n "$out" ]; then
+    echo "$out"
+  else
+    echo "-1"
+  fi
 }
 
 echo "waiting for in_flight to drain (timeout ${DRAIN_TIMEOUT}s)..."
 deadline=$(( $(date +%s) + DRAIN_TIMEOUT ))
 while :; do
   count="$(in_flight)"
-  if [ "$count" -le 0 ] 2>/dev/null; then
+  if [ "$count" -eq 0 ] 2>/dev/null; then
     echo "drained (in_flight=${count})"
     break
   fi
