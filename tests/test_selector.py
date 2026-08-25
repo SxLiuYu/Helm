@@ -240,3 +240,49 @@ def test_rank_dynamic_penalty_for_high_failure_rate(tmp_path: Path) -> None:
     # Reliable should be ranked first despite equal latency
     assert ranked[0].id == "reliable"
     store.close()
+
+
+# ── Explicit model pinning tests ─────────────────────────────────────
+
+
+def test_requested_model_pins_target_despite_bad_stats(tmp_path: Path) -> None:
+    """Naming a model tries that target first even when its historical stats
+    (stale ewma, high failure rate) would otherwise rank it last."""
+    app_config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=0),
+        targets=(
+            TargetConfig("healthy", "Healthy", "http://h/v1", "m1", local=True),
+            TargetConfig("flaky", "Flaky", "http://f/v1", "m2", local=True),
+        ),
+    )
+    store = Store(app_config.database, ["healthy", "flaky"])
+    store.record_success("healthy", 100, 1)
+    # flaky: slow ewma + failure history dominating any soft score bonus.
+    store.record_failure("flaky", 500, "old outage", 0.0)
+    store.record_failure("flaky", 500, "old outage", 0.0)
+    store.record_success("flaky", 15000, 1)
+    context = RouteContext("default", None, frozenset(), frozenset(), ())
+    ranked = rank_targets(app_config, context, store.all_stats(), requested_model="flaky")
+    assert ranked[0].id == "flaky"
+    assert [t.id for t in rank_targets(app_config, context, store.all_stats())][0] == "healthy"
+    store.close()
+
+
+def test_requested_model_pin_respects_circuit(tmp_path: Path) -> None:
+    """A circuit-open target is never pinned, even when explicitly named."""
+    import time as _time
+    app_config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(
+            TargetConfig("open", "Open", "http://o/v1", "m1", local=True),
+            TargetConfig("backup", "Backup", "http://b/v1", "m2", local=True),
+        ),
+    )
+    store = Store(app_config.database, ["open", "backup"])
+    store.record_failure("open", 429, "limited", _time.time() + 3600)
+    context = RouteContext("default", None, frozenset(), frozenset(), ())
+    ranked = rank_targets(app_config, context, store.all_stats(), requested_model="open")
+    assert [t.id for t in ranked] == ["backup"]
+    store.close()

@@ -98,6 +98,7 @@ def rank_targets(
 ) -> list[TargetConfig]:
     now = time.time()
     ranked: list[tuple[float, TargetConfig]] = []
+    pinned: TargetConfig | None = None
     for target in config.targets:
         state = stats[target.id]
         if not target.available or state.circuit_open_until > now:
@@ -130,6 +131,7 @@ def rank_targets(
         if requested_model and requested_model not in {"auto", "damselfish", "damselfish/auto"}:
             if requested_model in {target.id, target.model}:
                 score -= 10000.0
+                pinned = target
         # Load balancing: if the top target has served the vast majority of
         # recent requests, add a small random penalty to avoid pinning all
         # traffic to a single target.  This only applies when the target has
@@ -154,7 +156,15 @@ def rank_targets(
             for score, target in ranked
             if max(0.0, min(100.0, (1.0 - (score + 10000.0) / (max_expected + 10000.0)) * 100.0)) >= min_quality * quality_weight
         ]
-    return [target for _, target in ranked]
+    result = [target for _, target in ranked]
+    # An explicitly requested model is a hard preference: try it first no
+    # matter how badly its historical stats rank (stale ewma, old failures),
+    # while keeping the rest of the ranking as fallback order.  Targets
+    # excluded by the gates above (circuit open, missing capabilities) stay
+    # excluded — they never reach `pinned`.
+    if pinned is not None:
+        result = [pinned] + [target for target in result if target.id != pinned.id]
+    return result
 
 
 # Re-export for backward compatibility (tests import these directly)
