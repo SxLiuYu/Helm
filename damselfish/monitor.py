@@ -79,7 +79,8 @@ def get_disk_report(paths: list[str] | None = None) -> dict[str, Any]:
     warnings: list[str] = []
     critical = False
     for p in paths:
-        if not p.startswith("/"):
+        p = str(Path(p))  # Normalize path
+        if not Path(p).is_absolute():
             p = "/" + p
         info = get_disk_usage(p)
         disks[p] = info
@@ -114,11 +115,12 @@ def _safe_remove(path: Path, dry_run: bool = False) -> bool:
                                                 ".db", ".sqlite", ".lock")):
         return False
     try:
+        size = path.stat().st_size
         if dry_run:
-            log.info("[dry-run] would remove: %s (%d bytes)", path, path.stat().st_size)
+            log.info("[dry-run] would remove: %s (%d bytes)", path, size)
         else:
             path.unlink()
-            log.info("removed: %s (%d bytes)", path, path.stat().st_size)
+            log.info("removed: %s (%d bytes)", path, size)
         return True
     except Exception as exc:
         log.warning("failed to remove %s: %s", path, exc)
@@ -193,7 +195,8 @@ def serve(port: int = 9876, monitor_paths: list[str] | None = None) -> None:
                 self.end_headers()
         def do_POST(self):
             if self.path == "/monitor/cleanup":
-                length = int(self.headers.get("Content-Length", 0))
+                MAX_BODY = 1_048_576  # 1 MB
+                length = min(int(self.headers.get("Content-Length", 0)), MAX_BODY)
                 body = self.rfile.read(length) if length else b"{}"
                 params: dict = {}
                 try:

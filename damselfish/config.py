@@ -10,6 +10,21 @@ import yaml
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderConfig:
+    """Stub for provider configuration used in provider-based routing."""
+    id: str = ""
+    label: str = ""
+    base_url: str = ""
+    api_key_env: str | None = None
+    free: bool = True
+    priority: int = 100
+    probe: bool = False
+    capabilities: frozenset[str] = frozenset()
+    headers: tuple[tuple[str, str], ...] = ()
+    models: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
 class TargetConfig:
     id: str
     label: str
@@ -30,6 +45,11 @@ class TargetConfig:
     intelligence: int = 50
     api_format: str = "chat"
     api_key_value: str = field(default="", repr=False, compare=False)
+    api_key_envs: tuple[str, ...] = ()
+    api_key_values: tuple[str, ...] = ()
+    extra_headers: tuple[tuple[str, str], ...] = ()
+    extra_headers_dict: dict[str, str] = field(default_factory=dict)
+    provider_id: str | None = None
 
     @property
     def chat_url(self) -> str:
@@ -43,6 +63,10 @@ class TargetConfig:
         if self.api_key_value:
             return self.api_key_value
         return os.environ.get(self.api_key_env, "") if self.api_key_env else ""
+
+    def resolved_keys(self) -> tuple[str, ...]:
+        """Resolve all API keys from environment variables."""
+        return tuple(os.environ.get(env, "") for env in self.api_key_envs)
 
     @property
     def available(self) -> bool:
@@ -64,6 +88,8 @@ class PersonaRule:
     required: frozenset[str] = frozenset()
     preferred: frozenset[str] = frozenset()
     targets: tuple[str, ...] = ()
+    min_quality: int = 0
+    quality_weight: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +119,9 @@ class RoutingConfig:
     cache_max_entries: int = 512
     guardrail_min_content_length: int = 1
     daily_usage_token_limit: int = 2000000
+    key_rotation: str = "sticky"
+    key_probe_minutes: float = 10.0
+    quality_weight_ms: float = 8.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +166,16 @@ def _set(value: Any, default: tuple[str, ...] = ()) -> frozenset[str]:
 
 def _tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item) for item in (value or ()))
+
+
+def expand_providers(raw: dict[str, Any]) -> tuple[TargetConfig, ...]:
+    """Expand provider definitions into individual target configs.
+
+    This is a stub implementation that returns empty tuple.
+    Full implementation should handle provider inheritance, model overrides,
+    id derivation, and header merging.
+    """
+    return ()
 
 
 def _route_rule(raw: dict[str, Any]) -> RouteRule:
@@ -229,6 +268,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             required=_set((value or {}).get("required")),
             preferred=_set((value or {}).get("preferred")),
             targets=_tuple((value or {}).get("targets")),
+            min_quality=int((value or {}).get("min_quality", 0)),
+            quality_weight=float((value or {}).get("quality_weight", 1.0)),
         )
         for name, value in raw.get("personas", {}).items()
     }

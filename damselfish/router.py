@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import random
 import time
 from collections import deque
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +20,19 @@ from .store import Store
 from .tokens import estimate_text_tokens, estimate_messages_tokens
 
 log = logging.getLogger("damselfish.router")
+
+# Per-request context variables to avoid concurrent request clobbering.
+# These replace instance variables that were shared across concurrent requests.
+_stream_result_var: ContextVar[CompletionResult | None] = ContextVar(
+    "_stream_result", default=None
+)
+_raced_ids_var: ContextVar[set[str]] = ContextVar("_raced_ids", default=set())
+_race_winner_iterator_var: ContextVar[AsyncIterator[dict] | None] = ContextVar(
+    "_race_winner_iterator", default=None
+)
+_race_first_chunk_var: ContextVar[dict | None] = ContextVar(
+    "_race_first_chunk", default=None
+)
 
 
 @dataclass(slots=True)
@@ -53,6 +68,31 @@ class NoTargetAvailable(Exception):
     pass
 
 
+class KeyRotator:
+    """Stub KeyRotator for key rotation in multi-key configurations."""
+
+    def __init__(self, strategy: str = "sticky", probe_minutes: float = 10) -> None:
+        self.strategy = strategy if strategy in ("sticky", "round_robin") else "sticky"
+        self._probe_minutes = probe_minutes
+        self._cooldowns: dict[str, float] = {}
+
+    def pick(self, target: TargetConfig) -> tuple[int, str]:
+        """Pick a key index and value for the target. Returns (index, key)."""
+        keys = target.api_key_envs if hasattr(target, 'api_key_envs') else (target.api_key_env,)
+        if not keys or not any(keys):
+            return (0, "")
+        # Simple sticky: return first available key
+        return (0, keys[0] if keys else "")
+
+    def report(self, target: TargetConfig, key_index: int, status_code: int) -> None:
+        """Report the result of using a key."""
+        pass
+
+    def cooldown_remaining(self, target_id: str, key_index: int) -> float:
+        """Return remaining cooldown in seconds for a key."""
+        return 0.0
+
+
 class ModelRouter:
     _WINDOW_SIZE = 20
     _WINDOW_MIN = 8
@@ -78,11 +118,10 @@ class ModelRouter:
             for target in config.targets
         }
         self._family_semaphores = self._build_family_semaphores(config.targets)
-        self._raced_ids: set[str] = set()
-        # For stream race: store winner's iterator and first chunk so caller
-        # can continue streaming after the race succeeds.
-        self._race_winner_iterator: AsyncIterator[dict] | None = None
-        self._race_first_chunk: dict[str, Any] | None = None
+        # NOTE: _raced_ids, _race_winner_iterator, _race_first_chunk, and
+        # _stream_result were previously instance variables that caused
+        # concurrent request clobbering. They are now passed as local
+        # variables through the call chain.
         # In-flight upstream request gauge (exposed via /stats) so deploys can
         # wait for streams to drain instead of killing them mid-flight.
         self.in_flight = 0
@@ -92,30 +131,39 @@ class ModelRouter:
         # success rate is needed to quarantine them.
         self._outcomes: dict[str, deque[bool]] = {}
 
-    def _record_outcome(self, target_id: str, ok: bool) -> None:
+    def _record_outcome(self, target_id: str, ok: bool) -> tuple[bool, float]:
+        """Record an outcome and return (quarantine_triggered, success_rate).
+
+        When quarantine_triggered is True, the caller should NOT call
+        store.record_failure again as it was already called with the sliding
+        window delay.
+        """
         window = self._outcomes.setdefault(
             target_id, deque(maxlen=self._WINDOW_SIZE)
         )
         window.append(ok)
         if ok or len(window) < self._WINDOW_MIN:
-            return
+            return False, 0.0
         rate = sum(window) / len(window)
         if rate >= self._WINDOW_RATE:
-            return
+            return False, rate
+        # Sliding window quarantine triggered. Call store.record_failure
+        # with the sliding window delay. _record_failure will skip calling
+        # record_failure again if quarantine_triggered is True.
         delay = min(
             max(self.config.routing.circuit_base_seconds * 4.0, 60.0),
             self.config.routing.circuit_max_seconds,
         )
-        message = (
-            f"sliding-window quarantine: success rate {rate:.0%} "
-            f"over last {len(window)} requests"
+        log.warning(
+            "target=%s sliding-window quarantine: success rate %.0f%% over last %d requests",
+            target_id, rate, len(window),
         )
         self.store.record_failure(
-            target_id, 200, message, time.time() + delay, False
+            target_id, 200, f"sliding-window quarantine: success rate {rate:.0%} over last {len(window)} requests",
+            time.time() + delay, False,
         )
         window.clear()
-        log.warning("target=%s status=200 circuit_seconds=%.0f error=%s",
-                    target_id, delay, message)
+        return True, rate
 
     def _build_family_semaphores(
         self, targets: tuple[TargetConfig, ...]
@@ -138,12 +186,21 @@ class ModelRouter:
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
         self._semaphores = {
-            target.id: self._semaphores.get(
-                target.id, asyncio.Semaphore(target.max_concurrency)
-            )
+            target.id: asyncio.Semaphore(target.max_concurrency)
             for target in config.targets
         }
         self._family_semaphores = self._build_family_semaphores(config.targets)
+        # Clean up outcomes for targets no longer in config
+        current_ids = {t.id for t in config.targets}
+        self._outcomes = {k: v for k, v in self._outcomes.items() if k in current_ids}
+
+    @property
+    def _stream_result(self) -> CompletionResult | None:
+        """Property for backward-compatible access to stream result from app.py.
+
+        Uses context variable to ensure per-request isolation.
+        """
+        return _stream_result_var.get()
 
     def _apply_session_pin(
         self,
@@ -211,14 +268,14 @@ class ModelRouter:
                 raise NoTargetAvailable(
                     f"primary target {primary.id} failed: HTTP {error.status} {error}"
                 ) from error
-            result = await self._race_targets(
+            result, raced_ids = await self._race_targets(
                 targets[1:], payload, context, session_id,
             )
             if result is None:
                 # All parallel candidates failed; try the rest serially.
                 suffix = [
                     t for t in targets[1:]
-                    if t.id not in self._raced_ids
+                    if t.id not in raced_ids
                 ]
                 result = await self._serial_fallback(
                     suffix, payload, context, session_id,
@@ -243,7 +300,8 @@ class ModelRouter:
 
         Yields normalized SSE chunks.  On 429/504 before the first chunk,
         falls through to parallel race.  After the stream ends, the caller
-        can read ``self._stream_result`` for the final ``CompletionResult``.
+        can read the ``_stream_result`` context variable for the final
+        ``CompletionResult`` via ``router._stream_result`` property.
         """
         requested_model = str(payload.get("model", "auto"))
         targets = rank_targets(
@@ -259,7 +317,7 @@ class ModelRouter:
                 f"no healthy target has required capabilities: {sorted(context.required)}"
             )
 
-        self._stream_result: CompletionResult | None = None
+        _stream_result_var.set(None)
         primary = targets[0]
         iterator = self._stream_call(primary, payload)
         try:
@@ -298,14 +356,14 @@ class ModelRouter:
                     f"primary target {primary.id} failed: HTTP {error.status} {error}"
                 ) from error
             # Phase 2: parallel race
-            result = await self._race_stream(
+            result, winner_iterator, first_chunk, raced_ids = await self._race_stream(
                 targets[1:], payload, context, session_id,
             )
             if result is None:
                 # Phase 3: serial fallback on leftovers
-                suffix = [t for t in targets[1:] if t.id not in self._raced_ids]
+                suffix = [t for t in targets[1:] if t.id not in raced_ids]
                 result = await self._serial_fallback(suffix, payload, context, session_id)
-                self._stream_result = result
+                _stream_result_var.set(result)
                 self.store.record_decision(
                     session_id, context.scenario, context.persona, result.target.id,
                     result.latency_ms, True,
@@ -334,7 +392,7 @@ class ModelRouter:
                 return
             # _race_stream succeeded: yield the first chunk from the winner,
             # then continue streaming from the winner's iterator.
-            self._stream_result = result
+            _stream_result_var.set(result)
             self.store.record_decision(
                 session_id, context.scenario, context.persona, result.target.id,
                 result.latency_ms, True,
@@ -345,15 +403,14 @@ class ModelRouter:
             )
             # The winner's first chunk was already consumed by _race_stream;
             # yield it, then continue from the winner's iterator.
-            winner_iterator = self._race_winner_iterator
             if winner_iterator is not None:
-                yield self._race_first_chunk
+                yield first_chunk
                 async for chunk in winner_iterator:
                     yield chunk
                 # If the winner's stream ended without a finish_reason, add one
                 # so clients know the stream is complete.
-                if self._race_first_chunk and self._race_first_chunk.get("choices"):
-                    last_finish = self._race_first_chunk["choices"][0].get("finish_reason")
+                if first_chunk and first_chunk.get("choices"):
+                    last_finish = first_chunk["choices"][0].get("finish_reason")
                     if not last_finish:
                         yield _normalize_stream_chunk(
                             {"choices": [{"delta": {}, "finish_reason": "stop"}]},
@@ -366,14 +423,14 @@ class ModelRouter:
             yield chunk
         async for chunk in iterator:
             yield chunk
-        self._stream_result = CompletionResult(body={}, target=primary, latency_ms=0)
+        _stream_result_var.set(CompletionResult(body={}, target=primary, latency_ms=0))
         self.store.record_decision(
             session_id, context.scenario, context.persona, primary.id,
-            self._stream_result.latency_ms, True,
+            _stream_result_var.get().latency_ms, True,
         )
         log.info(
             "route scenario=%s persona=%s target=%s latency_ms=%.1f (stream)",
-            context.scenario, context.persona or "-", primary.id, self._stream_result.latency_ms,
+            context.scenario, context.persona or "-", primary.id, _stream_result_var.get().latency_ms,
         )
 
     async def _race_targets(
@@ -382,19 +439,18 @@ class ModelRouter:
         payload: dict[str, Any],
         context: RouteContext,
         session_id: str | None,
-    ) -> CompletionResult | None:
+    ) -> tuple[CompletionResult | None, set[str]]:
         """Race up to ``parallel_fallback_count`` candidates in parallel.
 
-        Returns the first successful ``CompletionResult`` and cancels the rest.
-        Records a decision row for every attempted target and tracks the ids in
-        ``self._raced_ids`` so the caller can serially retry the leftovers.
-        Returns ``None`` if every parallel attempt fails or the race times out.
+        Returns (first_successful_result, raced_ids_set). The raced_ids_set
+        allows the caller to serially retry the leftovers.
+        Returns (None, set()) if every parallel attempt fails or times out.
         """
         limit = max(1, self.config.routing.parallel_fallback_count)
         racing = candidates[:limit]
         if not racing:
-            return None
-        self._raced_ids = {target.id for target in racing}
+            return None, set()
+        raced_ids = {target.id for target in racing}
         timeout = self.config.routing.parallel_fallback_timeout_seconds
 
         tasks: dict[asyncio.Task[CompletionResult], TargetConfig] = {}
@@ -416,7 +472,7 @@ class ModelRouter:
                         "parallel fallback timed out after %.1fs; tried %s",
                         timeout, ", ".join(t.id for t in racing),
                     )
-                    return None
+                    return None, raced_ids
                 for task in done:
                     target = tasks[task]
                     try:
@@ -441,12 +497,12 @@ class ModelRouter:
                     # Winner: cancel the remaining tasks and return.
                     for leftover in pending:
                         leftover.cancel()
-                    return result
+                    return result, raced_ids
             log.warning(
                 "all parallel fallback targets failed: %s",
                 "; ".join(failures),
             )
-            return None
+            return None, raced_ids
         finally:
             for task in tasks:
                 if not task.done():
@@ -458,20 +514,17 @@ class ModelRouter:
         payload: dict[str, Any],
         context: RouteContext,
         session_id: str | None,
-    ) -> CompletionResult | None:
+    ) -> tuple[CompletionResult | None, AsyncIterator[dict] | None, dict | None, set[str]]:
         """Race up to ``parallel_fallback_count`` streaming candidates.
 
-        Returns the first candidate's ``CompletionResult`` and sets
-        ``self._stream_result`` to the winner.  Returns ``None`` if every
-        parallel attempt fails or times out.
+        Returns (completion_result, winner_iterator, first_chunk, raced_ids).
+        Returns (None, None, None, raced_ids) if every parallel attempt fails or times out.
         """
         limit = max(1, self.config.routing.parallel_fallback_count)
         racing = candidates[:limit]
         if not racing:
-            return None
-        self._raced_ids = {target.id for target in racing}
-        self._race_winner_iterator = None
-        self._race_first_chunk = None
+            return None, None, None, set()
+        raced_ids = {target.id for target in racing}
         timeout = self.config.routing.parallel_fallback_timeout_seconds
 
         first_chunk_tasks: dict[asyncio.Task, TargetConfig] = {}
@@ -485,6 +538,8 @@ class ModelRouter:
         pending = set(first_chunk_tasks)
         failures: list[str] = []
         winner_target: TargetConfig | None = None
+        winner_iterator: AsyncIterator[dict] | None = None
+        first_chunk: dict | None = None
         try:
             while pending and winner_target is None:
                 done, pending = await asyncio.wait(
@@ -515,15 +570,14 @@ class ModelRouter:
                         continue
                     # Winner!
                     winner_target = target
-                    self._race_winner_iterator = iterators[winner_target]
-                    self._race_first_chunk = first_chunk
+                    winner_iterator = iterators[winner_target]
                     break
             if winner_target is None:
                 log.warning(
                     "all parallel stream candidates failed: %s",
                     "; ".join(failures),
                 )
-                return None
+                return None, None, None, raced_ids
             # Cancel remaining tasks and close losing iterators
             for task in pending:
                 task.cancel()
@@ -538,10 +592,15 @@ class ModelRouter:
                         await it.aclose()
                     except RuntimeError:
                         pass
-            return CompletionResult(
-                body={"choices": [{"message": {"content": ""}}]},
-                target=winner_target,
-                latency_ms=0,
+            return (
+                CompletionResult(
+                    body={"choices": [{"message": {"content": ""}}]},
+                    target=winner_target,
+                    latency_ms=0,
+                ),
+                winner_iterator,
+                first_chunk,
+                raced_ids,
             )
         finally:
             for task in first_chunk_tasks:
@@ -746,14 +805,17 @@ class ModelRouter:
                 return
             async for line in response.aiter_lines():
                 line = line.strip()
-                if not line.startswith("data: "):
+                if not line.startswith("data:"):
                     continue
-                data = line[6:]
+                data = line[5:].lstrip(" ")
+                if not data:
+                    continue
                 if data == "[DONE]":
                     return
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
+                    log.debug("malformed JSON in SSE data line: %r", data)
                     continue
                 if target.api_format == "messages":
                     normalized = _from_messages_stream_event(chunk, target.model)
@@ -788,26 +850,32 @@ class ModelRouter:
                     )
                 yield normalized
         except UpstreamFailure as error:
-            if not _first_yielded:
-                self._record_failure(target, error.status, str(error), probe,
-                                     error.retry_after)
+            self._record_failure(target, error.status, str(error), probe,
+                                 error.retry_after)
             raise
         except httpx.TimeoutException as error:
             failure = UpstreamFailure(target, 504, f"timeout: {error}")
-            if not _first_yielded:
-                self._record_failure(target, failure.status, str(failure), probe)
+            self._record_failure(target, failure.status, str(failure), probe)
             raise failure from error
         except (httpx.HTTPError, ValueError, TypeError) as error:
             failure = UpstreamFailure(target, 502, f"invalid upstream response: {error}")
-            if not _first_yielded:
-                self._record_failure(target, failure.status, str(failure), probe)
+            self._record_failure(target, failure.status, str(failure), probe)
             raise failure from error
 
     def _record_failure(
         self, target: TargetConfig, status: int, message: str, probe: bool,
         retry_after: float = 0.0,
     ) -> None:
-        self._record_outcome(target.id, False)
+        quarantine_triggered, rate = self._record_outcome(target.id, False)
+        # If sliding window quarantine was triggered, _record_outcome already
+        # called store.record_failure with the sliding window delay. Skip to
+        # avoid overwriting with a different consecutive failure delay.
+        if quarantine_triggered:
+            log.warning(
+                "target=%s status=%s circuit_seconds=%.0f error=%s",
+                target.id, status, 0.0, message[:200],
+            )
+            return
         state = self.store.stats(target.id)
         count = state.consecutive_failures + 1
         if status == 429:
@@ -864,7 +932,12 @@ class ModelRouter:
                 >= self.config.routing.probe_stale_seconds
             ]
             if stale:
-                await asyncio.gather(*(self.probe(target) for target in stale))
+                results = await asyncio.gather(
+                    *(self.probe(target) for target in stale), return_exceptions=True
+                )
+                for target, result in zip(stale, results):
+                    if isinstance(result, Exception):
+                        log.warning("probe %s raised: %s", target.id, result)
             try:
                 await asyncio.wait_for(
                     stop.wait(), timeout=self.config.routing.probe_interval_seconds
@@ -1096,7 +1169,7 @@ def _upstream_payload(
     payload: dict[str, Any], target: TargetConfig, probe: bool
 ) -> tuple[dict[str, Any], bool]:
     request = {key: value for key, value in payload.items() if key in UPSTREAM_FIELDS}
-    request["messages"] = _ensure_tool_call_ids(request.get("messages", []))
+    request["messages"] = _ensure_tool_call_ids(copy.deepcopy(request.get("messages", [])))
     request["model"] = target.model
     request["stream"] = False
     if probe:
@@ -1224,6 +1297,8 @@ def _chunk_has_reasoning(chunk: dict[str, Any]) -> bool:
 def _error_message(response: httpx.Response) -> str:
     try:
         body = response.json()
+        if not isinstance(body, dict):
+            return response.text[:500]
         error = body.get("error", body)
         if isinstance(error, dict):
             return str(error.get("message", error))[:500]

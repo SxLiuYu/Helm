@@ -191,7 +191,7 @@ def _rank_targets_once(
         if target.max_context is not None:
             if context.estimated_input_tokens + max_new_tokens > target.max_context:
                 continue
-        latency = state.ewma_latency_ms or config.routing.unknown_latency_ms
+        latency = state.ewma_latency_ms if state.ewma_latency_ms is not None else config.routing.unknown_latency_ms
         attempts = state.successes + state.failures
         failure_rate = state.failures / attempts if attempts else 0.0
         score = latency + failure_rate * config.routing.failure_penalty_ms

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import uvicorn
+import yaml
 
 from .config import load_config
 
@@ -18,10 +19,20 @@ def main() -> None:
     parser.add_argument("--port", type=int)
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError:
+        print(f"Error: config file not found: {args.config}")
+        raise SystemExit(1)
+    except yaml.YAMLError as e:
+        print(f"Error: invalid YAML in config: {e}")
+        raise SystemExit(1)
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        raise SystemExit(1)
     os.environ["DAMSELFISH_CONFIG"] = args.config
 
-    level = getattr(logging, args.log_level.upper())
+    level = getattr(logging, args.log_level.upper(), logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s")
 
     # Console handler

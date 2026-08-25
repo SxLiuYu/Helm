@@ -25,6 +25,7 @@ from .router import ModelRouter, NoTargetAvailable
 from .pipeline import plan_collaboration, run_pipeline, sse_stream_from_text, CollabUnavailable
 from .selector import infer_context, resolve_allowed_targets, RouteContext
 from .store import Store, merge_messages, project_context_message
+from .tokens import estimate_messages_tokens
 
 log = logging.getLogger("damselfish")
 
@@ -498,8 +499,6 @@ async def _compress_conversation(store, router, session_id, messages, keep):
             "涵盖用户需求、已解决的问题和关键决策。\n"
             "保留足够细节以保持对话连续性。最多 200 字。\n\n" + text
         )
-        from .selector import RouteContext
-        from .tokens import estimate_messages_tokens
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 400, "temperature": 0.5,

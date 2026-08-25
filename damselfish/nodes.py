@@ -23,6 +23,13 @@ class NodeValidationError(ValueError):
     pass
 
 
+def mask_api_key(key: str) -> str:
+    """Mask an API key for display, showing first 4 and last 4 characters."""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return key[:4] + "***" + key[-4:]
+
+
 class ManagedNodeStore:
     def __init__(self, path: Path | None) -> None:
         self.path = path

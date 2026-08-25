@@ -52,6 +52,8 @@ class CloudMemoryConfig:
     decision_history_limit: int = 200
     max_snapshot_chars: int = 50000
     mode: str = "push_pull"
+    # TLS certificate verification. Set to false only for dev with self-signed certs.
+    verify: bool = True
 
     @property
     def api_key_value(self) -> str:
@@ -95,7 +97,7 @@ class CloudMemorySync:
         timeout = httpx.Timeout(10.0, connect=5.0)
         self._http_client = httpx.AsyncClient(
             timeout=timeout,
-            verify=False,
+            verify=self.config.verify,
         )
         self._stop_event = asyncio.Event()
         self._started_at = time.time()

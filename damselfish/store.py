@@ -542,7 +542,10 @@ class Store:
             ).fetchall()
         context = []
         for row in reversed(rows):
-            messages = json.loads(row["messages_json"])
+            try:
+                messages = json.loads(row["messages_json"])
+            except json.JSONDecodeError:
+                continue
             context.append(
                 {
                     "session_id": row["session_id"],
@@ -557,7 +560,13 @@ class Store:
             rows = self._connection.execute(
                 "SELECT snapshot_json FROM memory_events WHERE synced = 0 ORDER BY created_at"
             ).fetchall()
-        return [json.loads(row["snapshot_json"]) for row in rows]
+        events = []
+        for row in rows:
+            try:
+                events.append(json.loads(row["snapshot_json"]))
+            except json.JSONDecodeError:
+                continue
+        return events
 
     def pending_memory_event_count(self) -> int:
         with self._lock:
