@@ -1289,3 +1289,102 @@ def test_in_flight_gauge_tracks_and_drains(tmp_path: Path) -> None:
     assert observed and all(value >= 1 for value in observed)
     assert holder["router"].in_flight == 0
     store.close()
+
+
+# ── Session affinity (sticky routing) ─────────────────────────────────
+
+
+PIN_CONFIG = dict(
+    host="127.0.0.1",
+    port=8086,
+    routing=None,  # placeholder, replaced below
+)
+
+
+def _pin_setup(tmp_path: Path):
+    config = AppConfig(
+        host="127.0.0.1",
+        port=8086,
+        database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("first", "First", "http://router/v1", "first", local=True, priority=1),
+            TargetConfig("second", "Second", "http://router/v1", "second", local=True, priority=2),
+        ),
+    )
+    store = Store(config.database, ["first", "second"])
+    return config, store
+
+
+def test_session_pin_sticks_within_ranked_list(tmp_path: Path) -> None:
+    """Once a session succeeds on a target it keeps that target even when
+    global ranking would prefer another one."""
+    config, store = _pin_setup(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            ctx = RouteContext("default", None, frozenset(), frozenset(), ())
+            payload = {"model": "auto", "messages": [{"role": "user", "content": "hello"}]}
+            # Ranking prefers "first" (lower priority number).
+            r1 = await router.complete(dict(payload), ctx, "sess-1")
+            assert r1.target.id == "first"
+            assert store.get_session_route("sess-1") == "first"
+            # Make "second" rank first globally…
+            store.record_success("second", 10, 1)
+            # …the pinned session stays on first.
+            r2 = await router.complete(dict(payload), ctx, "sess-1")
+            assert r2.target.id == "first"
+            # A fresh session follows the new ranking (first degraded far
+            # below second; no further traffic touches first before r3).
+            store.record_success("first", 50000, 1)
+            r3 = await router.complete(dict(payload), ctx, "sess-2")
+            assert r3.target.id == "second"
+            # An explicit model request overrides the pin.
+            r4 = await router.complete(
+                {"model": "second", "messages": [{"role": "user", "content": "hello"}]},
+                ctx, "sess-1",
+            )
+            assert r4.target.id == "second"
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_session_pin_moves_after_pinned_target_fails(tmp_path: Path) -> None:
+    """Pre-commit failure of the pinned target hands the session to the next
+    ranked member and re-pins there (self-healing affinity)."""
+    config, store = _pin_setup(tmp_path)
+    state = {"fail_second": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = __import__("json").loads(request.content)["model"]
+        if model == "second" and state["fail_second"]:
+            return httpx.Response(429, json={"error": {"message": "limited"}})
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            ctx = RouteContext("default", None, frozenset(), frozenset(), ())
+            payload = {"model": "auto", "messages": [{"role": "user", "content": "hello"}]}
+            store.record_success("second", 10, 1)  # second ranks first
+            r1 = await router.complete(dict(payload), ctx, "sess-x")
+            assert r1.target.id == "first"  # second 429'd pre-commit
+            assert store.get_session_route("sess-x") == "first"
+            state["fail_second"] = False
+            # Even with second healthy again, session sticks to first.
+            r2 = await router.complete(dict(payload), ctx, "sess-x")
+            assert r2.target.id == "first"
+
+    asyncio.run(run())
+    store.close()

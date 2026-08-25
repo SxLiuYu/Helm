@@ -22,7 +22,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .config import AppConfig, load_config
 from .git_sync import GitMemorySync
 from .router import ModelRouter, NoTargetAvailable
-from .selector import infer_context, RouteContext
+from .pipeline import plan_collaboration, run_pipeline, sse_stream_from_text, CollabUnavailable
+from .selector import infer_context, resolve_allowed_targets, RouteContext
 from .store import Store, merge_messages, project_context_message
 
 log = logging.getLogger("damselfish")
@@ -325,9 +326,32 @@ load();setInterval(load,10000);
             context = replace(context, persona=header_persona.lower())
         if header_scenario and context.scenario == "default":
             context = replace(context, scenario=header_scenario.lower())
+        # Persona/scenario `targets` lists are hard allowlists; resolve after
+        # header overrides so an explicit persona header also restricts.
+        context = resolve_allowed_targets(loaded, context)
         wants_stream = bool(payload.get("stream"))
         try:
             decision_session = f"{project_id}/{session_id}" if session_id else None
+            # Multi-role collaboration: a bare question that spans roles
+            # (e.g. 评估+修复) runs as a staged pipeline.  Agent turns (tools)
+            # are never pipelined implicitly; on any pipeline failure the
+            # normal single-model path below takes over.
+            collab_roles = plan_collaboration(
+                payload, loaded, request.headers.get("x-damselfish-collab"),
+            )
+            if collab_roles:
+                response = await _handle_collaboration(
+                    request, payload, context, decision_session, collab_roles,
+                    memory_enabled=memory_enabled,
+                    transcript=transcript,
+                    session_id=session_id,
+                    project_id=project_id,
+                    project_title=project_title,
+                    session_title=session_title,
+                    max_messages=loaded.routing.memory_max_messages,
+                )
+                if response is not None:
+                    return response
             if wants_stream:
                 return await _handle_streaming(
                     request, payload, context, decision_session,
@@ -528,6 +552,72 @@ async def _as_sse(body: dict[str, Any]) -> AsyncIterator[str]:
         chunk["usage"] = body["usage"]
     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+async def _handle_collaboration(
+    request: Request,
+    payload: dict[str, Any],
+    context: RouteContext,
+    decision_session: str | None,
+    roles: tuple[str, ...],
+    *,
+    memory_enabled: bool,
+    transcript: list[dict[str, Any]],
+    session_id: str | None,
+    project_id: str,
+    project_title: str | None,
+    session_title: str | None,
+    max_messages: int,
+) -> JSONResponse | StreamingResponse | None:
+    """Run the multi-role pipeline.  Returns None to fall back to normal
+    single-model routing when the pipeline cannot produce anything."""
+    started = time.perf_counter()
+    try:
+        body, meta = await run_pipeline(
+            request.app.state.router, request.app.state.config, payload,
+            context, decision_session, roles,
+        )
+    except CollabUnavailable as error:
+        log.warning("collab pipeline unavailable (%s); normal routing takes over", error)
+        return None
+    except Exception as error:  # noqa: BLE001 — the pipeline must never break the endpoint
+        log.warning("collab pipeline error (%s); normal routing takes over", error)
+        return None
+
+    if memory_enabled and session_id:
+        assistant = body["choices"][0]["message"]
+        request.app.state.store.save_session(
+            session_id,
+            transcript + [assistant],
+            max_messages,
+            project_id=project_id,
+            project_title=project_title,
+            session_title=session_title,
+            source_device=request.app.state.memory_sync.device_id,
+        )
+        await request.app.state.memory_sync.sync_pending()
+
+    targets = [part.split("=", 1)[1] for part in meta["targets"]]
+    headers = {
+        "X-Damselfish-Target": ",".join(dict.fromkeys(targets)),
+        "X-Damselfish-Model": "damselfish/collab",
+        "X-Damselfish-Pipeline": ", ".join(meta["targets"]),
+        "X-Damselfish-Latency-Ms": f"{(time.perf_counter() - started) * 1000:.1f}",
+        "X-Damselfish-Scenario": context.scenario,
+        "X-Damselfish-Project": project_id,
+        "X-Damselfish-Memory-Sync": request.app.state.memory_sync.response_status(),
+    }
+    if session_id:
+        headers["X-Damselfish-Session"] = session_id
+
+    if payload.get("stream"):
+        merged = body["choices"][0]["message"]["content"]
+        return StreamingResponse(
+            sse_stream_from_text(merged, str(payload.get("model", "auto"))),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+    return JSONResponse(content=body, headers=headers)
 
 
 async def _handle_streaming(

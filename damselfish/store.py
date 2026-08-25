@@ -110,6 +110,11 @@ class Store:
                     snapshot_json TEXT NOT NULL,
                     synced INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS session_routes (
+                    session_id TEXT PRIMARY KEY,
+                    target_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL,
@@ -148,6 +153,11 @@ class Store:
             self._connection.executemany(
                 "INSERT OR IGNORE INTO target_stats(target_id) VALUES (?)",
                 [(target_id,) for target_id in target_ids],
+            )
+            # Drop stale session-affinity pins (sessions inactive for 2 weeks)
+            self._connection.execute(
+                "DELETE FROM session_routes WHERE updated_at < ?",
+                (time.time() - 14 * 86400,),
             )
 
     def stats(self, target_id: str) -> TargetStats:
@@ -302,6 +312,37 @@ class Store:
                     latency_ms, int(success), status, error[:500] if error else None,
                 ),
             )
+            # Session affinity: remember the last target that served this
+            # session successfully so subsequent requests stick to it instead
+            # of bouncing across the pool.  Failures don't clear the pin — the
+            # next success (possibly on a different member) overwrites it.
+            if success and session_id and target_id:
+                self._connection.execute(
+                    """
+                    INSERT INTO session_routes(session_id, target_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        target_id = excluded.target_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (session_id, target_id, time.time()),
+                )
+
+    def get_session_route(self, session_id: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT target_id FROM session_routes WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row["target_id"] if row else None
+
+    def prune_session_routes(self, max_age_seconds: float = 14 * 86400) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM session_routes WHERE updated_at < ?",
+                (time.time() - max_age_seconds,),
+            )
+        return cursor.rowcount
 
     def recent_decisions(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:

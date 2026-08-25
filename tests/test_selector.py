@@ -1,8 +1,9 @@
 from pathlib import Path
 from typing import Any
 
-from damselfish.config import AppConfig, RouteRule, RoutingConfig, TargetConfig
+from damselfish.config import AppConfig, PersonaRule, RouteRule, RoutingConfig, TargetConfig
 from damselfish.selector import (
+    resolve_allowed_targets,
     RouteContext,
     _estimate_messages_tokens,
     _estimate_text_tokens,
@@ -286,3 +287,148 @@ def test_requested_model_pin_respects_circuit(tmp_path: Path) -> None:
     ranked = rank_targets(app_config, context, store.all_stats(), requested_model="open")
     assert [t.id for t in ranked] == ["backup"]
     store.close()
+
+
+# ── Persona/scenario target allowlist ────────────────────────────────
+
+
+def two_target_config(tmp_path: Path):
+    app_config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=0),
+        targets=(
+            TargetConfig("alpha", "Alpha", "http://a/v1", "a", local=True),
+            TargetConfig("beta", "Beta", "http://b/v1", "b", local=True),
+        ),
+        personas={"developer": PersonaRule(keywords=("programmer",), targets=("beta",))},
+        scenarios={
+            "default": RouteRule(preferred=frozenset({"chat"})),
+            "coding": RouteRule(targets=("alpha",)),
+        },
+    )
+    return app_config
+
+
+def test_allowed_targets_restrict_candidates(tmp_path: Path) -> None:
+    """The persona/scenario allowlist is a hard filter, not a preference."""
+    app_config = two_target_config(tmp_path)
+    store = Store(app_config.database, ["alpha", "beta"])
+    store.record_success("alpha", 10, 1)  # alpha ranks first globally
+    context = RouteContext(
+        "default", None, frozenset(), frozenset(), (), allowed_targets=("beta",),
+    )
+    assert [t.id for t in rank_targets(app_config, context, store.all_stats())] == ["beta"]
+    store.close()
+
+
+def test_allowlist_fallback_to_global_pool(tmp_path: Path) -> None:
+    """When every allowlist member is gated, degrade to the global pool."""
+    import time as _time
+    from dataclasses import replace as dc_replace
+
+    app_config = two_target_config(tmp_path)
+    store = Store(app_config.database, ["alpha", "beta"])
+    stats = store.all_stats()
+    stats["beta"] = dc_replace(stats["beta"], circuit_open_until=_time.time() + 999)
+    context = RouteContext(
+        "default", None, frozenset(), frozenset(), (), allowed_targets=("beta",),
+    )
+    assert [t.id for t in rank_targets(app_config, context, stats)] == ["alpha"]
+    store.close()
+
+
+def test_resolve_allowed_targets_persona_wins(tmp_path: Path) -> None:
+    app_config = two_target_config(tmp_path)
+    # Persona list wins over scenario list.
+    ctx = RouteContext("coding", "developer", frozenset(), frozenset(), ())
+    assert resolve_allowed_targets(app_config, ctx).allowed_targets == ("beta",)
+    # Persona without a list falls back to the scenario's list.
+    ctx = RouteContext("coding", "writer", frozenset(), frozenset(), ())
+    assert resolve_allowed_targets(app_config, ctx).allowed_targets == ("alpha",)
+    # Neither rule defines targets → unrestricted.
+    ctx = RouteContext("default", None, frozenset(), frozenset(), ())
+    assert resolve_allowed_targets(app_config, ctx).allowed_targets is None
+
+
+def test_infer_context_applies_persona_allowlist(tmp_path: Path) -> None:
+    app_config = two_target_config(tmp_path)
+    context = infer_context(
+        app_config,
+        [
+            {"role": "system", "content": "You are a programmer assistant."},
+            {"role": "user", "content": "hi"},
+        ],
+    )
+    assert context.persona == "developer"
+    assert context.allowed_targets == ("beta",)
+
+
+# ── Auto role detection from bare questions ──────────────────────────
+
+
+def roles_config(tmp_path: Path):
+    return AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=0),
+        targets=(
+            TargetConfig("alpha", "Alpha", "http://a/v1", "a", local=True),
+            TargetConfig("beta", "Beta", "http://b/v1", "b", local=True),
+        ),
+        personas={
+            "developer": PersonaRule(
+                keywords=("写代码", "报错", "bug", "python"), targets=("alpha",),
+            ),
+            "writer": PersonaRule(
+                keywords=("写诗", "诗", "文案", "公众号"), targets=("beta",),
+            ),
+        },
+        scenarios={"default": RouteRule(preferred=frozenset({"chat"}))},
+    )
+
+
+def test_bare_question_auto_selects_role(tmp_path: Path) -> None:
+    """No system prompt at all — the question alone picks the role."""
+    app_config = roles_config(tmp_path)
+    ctx = infer_context(
+        app_config, [{"role": "user", "content": "这段python代码报错了，帮我看看"}],
+    )
+    assert ctx.persona == "developer"
+    assert ctx.allowed_targets == ("alpha",)
+    ctx = infer_context(
+        app_config, [{"role": "user", "content": "帮我写一首关于秋天的诗"}],
+    )
+    assert ctx.persona == "writer"
+    assert ctx.allowed_targets == ("beta",)
+
+
+def test_role_switches_with_current_question(tmp_path: Path) -> None:
+    """Multi-role collaboration: a conversation that changes domain routes
+    each question to the role that fits it right now."""
+    app_config = roles_config(tmp_path)
+    msgs = [
+        {"role": "user", "content": "这段python代码报错怎么修"},
+        {"role": "assistant", "content": "已修复"},
+        {"role": "user", "content": "现在帮我写首诗"},
+    ]
+    ctx = infer_context(app_config, msgs)
+    assert ctx.persona == "writer"
+    assert ctx.allowed_targets == ("beta",)
+
+
+def test_system_prompt_outweighs_incidental_mention(tmp_path: Path) -> None:
+    """An agent configured as a developer stays a developer even when one
+    message mentions poetry (system hits weigh double)."""
+    app_config = roles_config(tmp_path)
+    msgs = [
+        {"role": "system", "content": "你是资深python专家助手。"},
+        {"role": "user", "content": "聊聊诗"},
+    ]
+    ctx = infer_context(app_config, msgs)
+    assert ctx.persona == "developer"
+
+
+def test_no_signal_falls_back_to_unrestricted(tmp_path: Path) -> None:
+    app_config = roles_config(tmp_path)
+    ctx = infer_context(app_config, [{"role": "user", "content": "你好"}])
+    assert ctx.persona is None
+    assert ctx.allowed_targets is None

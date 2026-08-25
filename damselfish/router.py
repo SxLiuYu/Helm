@@ -116,19 +116,51 @@ class ModelRouter:
             for target in config.targets
         }
 
+    def _apply_session_pin(
+        self,
+        targets: list[TargetConfig],
+        session_id: str | None,
+        requested_model: str | None,
+    ) -> list[TargetConfig]:
+        """Session affinity: keep a session on the target that last served it.
+
+        The pin only reorders within the already-ranked (persona-restricted)
+        list; if the pinned target is currently gated (circuit open etc.) the
+        session rides the next member of the list until a later success
+        overwrites the pin.  An explicit model request always wins.
+        """
+        if not session_id or len(targets) < 2:
+            return targets
+        if requested_model and requested_model not in {
+            "auto", "damselfish", "damselfish/auto",
+        }:
+            return targets
+        pinned_id = self.store.get_session_route(session_id)
+        if not pinned_id or pinned_id == targets[0].id:
+            return targets
+        pinned = next((t for t in targets if t.id == pinned_id), None)
+        if pinned is None:
+            return targets  # gated this round — failover list stands
+        log.info("session %s sticky to %s", session_id, pinned_id)
+        return [pinned] + [t for t in targets if t.id != pinned.id]
+
     async def complete(
         self,
         payload: dict[str, Any],
         context: RouteContext,
         session_id: str | None,
+        avoid: frozenset[str] | None = None,
     ) -> CompletionResult:
+        requested_model = str(payload.get("model", "auto"))
         targets = rank_targets(
             self.config,
             context,
             self.store.all_stats(),
-            str(payload.get("model", "auto")),
+            requested_model,
             max_new_tokens=_max_new_tokens(payload),
+            avoid=avoid,
         )
+        targets = self._apply_session_pin(targets, session_id, requested_model)
         if not targets:
             raise NoTargetAvailable(
                 f"no healthy target has required capabilities: {sorted(context.required)}"
@@ -184,13 +216,15 @@ class ModelRouter:
         falls through to parallel race.  After the stream ends, the caller
         can read ``self._stream_result`` for the final ``CompletionResult``.
         """
+        requested_model = str(payload.get("model", "auto"))
         targets = rank_targets(
             self.config,
             context,
             self.store.all_stats(),
-            str(payload.get("model", "auto")),
+            requested_model,
             max_new_tokens=_max_new_tokens(payload),
         )
+        targets = self._apply_session_pin(targets, session_id, requested_model)
         if not targets:
             raise NoTargetAvailable(
                 f"no healthy target has required capabilities: {sorted(context.required)}"

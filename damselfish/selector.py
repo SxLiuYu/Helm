@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import AppConfig, TargetConfig
 from .store import TargetStats
 from .tokens import estimate_messages_tokens, estimate_text_tokens
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +22,11 @@ class RouteContext:
     preferred: frozenset[str]
     preferred_targets: tuple[str, ...]
     estimated_input_tokens: int = 0
+    # Hard allowlist: when set, ranking only considers these target ids.
+    # Derived from the matched persona's `targets` list (falling back to the
+    # scenario's).  If every member is unhealthy we degrade to the global
+    # pool rather than fail the request.
+    allowed_targets: tuple[str, ...] | None = None
 
 
 SCENARIO_KEYWORDS = {
@@ -47,13 +56,28 @@ def infer_context(
         if message.get("role") == "system" and isinstance(message.get("content"), str):
             system_parts.append(message["content"])
     system_text = "".join(system_parts).lower()
+    # The question being asked RIGHT NOW — the latest user turn.  Roles
+    # follow the current question so a bare question (no agent system
+    # prompt) picks a role, and a conversation that changes domain
+    # automatically switches to the new role's fixed model list.
+    user_text = ""
+    for message in reversed(messages):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            user_text = message["content"].lower()
+            break
 
     selected_persona = persona.lower() if persona else None
     if not selected_persona:
+        # Role auto-detection from the current question: most keyword hits
+        # wins; system-prompt hits weigh double (an agent configured as a
+        # developer stays a developer even if one message mentions poetry).
+        best_score, best_name = 0, None
         for name, rule in config.personas.items():
-            if any(keyword in system_text for keyword in rule.keywords):
-                selected_persona = name
-                break
+            score = 2 * sum(1 for kw in rule.keywords if kw in system_text)
+            score += sum(1 for kw in rule.keywords if kw in user_text)
+            if score > best_score:
+                best_score, best_name = score, name
+        selected_persona = best_name
 
     if scenario:
         selected_scenario = scenario.lower()
@@ -79,13 +103,39 @@ def infer_context(
         required.update(persona_rule.required)
         preferred.update(persona_rule.preferred)
         preferred_targets = list(persona_rule.targets) + preferred_targets
-    return RouteContext(
-        scenario=selected_scenario,
-        persona=selected_persona,
-        required=frozenset(required),
-        preferred=frozenset(preferred),
-        preferred_targets=tuple(dict.fromkeys(preferred_targets)),
-        estimated_input_tokens=estimate_messages_tokens(messages),
+    return resolve_allowed_targets(
+        config,
+        RouteContext(
+            scenario=selected_scenario,
+            persona=selected_persona,
+            required=frozenset(required),
+            preferred=frozenset(preferred),
+            preferred_targets=tuple(dict.fromkeys(preferred_targets)),
+            estimated_input_tokens=estimate_messages_tokens(messages),
+        ),
+    )
+
+
+def resolve_allowed_targets(config: AppConfig, context: RouteContext) -> RouteContext:
+    """Pin down the hard target allowlist for a context.
+
+    Persona list wins when the persona defines one; otherwise the scenario's
+    list applies.  A rule without `targets` leaves the context unrestricted.
+    """
+    rule = None
+    persona_rule = (
+        config.personas.get(context.persona) if context.persona else None
+    )
+    if persona_rule is not None and persona_rule.targets:
+        rule = persona_rule
+    else:
+        scenario_rule = config.scenarios.get(context.scenario)
+        if scenario_rule is not None and scenario_rule.targets:
+            rule = scenario_rule
+    if rule is None:
+        return replace(context, allowed_targets=None)
+    return replace(
+        context, allowed_targets=tuple(dict.fromkeys(rule.targets))
     )
 
 
@@ -95,11 +145,43 @@ def rank_targets(
     stats: dict[str, TargetStats],
     requested_model: str | None = None,
     max_new_tokens: int = 1024,
+    avoid: frozenset[str] | None = None,
+) -> list[TargetConfig]:
+    result = _rank_targets_once(
+        config, context, stats, requested_model, max_new_tokens,
+        context.allowed_targets, avoid,
+    )
+    if not result and context.allowed_targets:
+        # Every member of the persona/scenario list is currently gated
+        # (circuit open, capability gap, context overflow).  Serving from
+        # the global pool beats interrupting the session with a 503.
+        log.warning(
+            "allowlist %s has no healthy target; falling back to global pool",
+            list(context.allowed_targets),
+        )
+        result = _rank_targets_once(
+            config, context, stats, requested_model, max_new_tokens, None, avoid,
+        )
+    return result
+
+
+def _rank_targets_once(
+    config: AppConfig,
+    context: RouteContext,
+    stats: dict[str, TargetStats],
+    requested_model: str | None,
+    max_new_tokens: int,
+    allowed_ids: tuple[str, ...] | None,
+    avoid: frozenset[str] | None = None,
 ) -> list[TargetConfig]:
     now = time.time()
     ranked: list[tuple[float, TargetConfig]] = []
     pinned: TargetConfig | None = None
     for target in config.targets:
+        if allowed_ids is not None and target.id not in allowed_ids:
+            continue
+        if avoid and target.id in avoid:
+            continue
         state = stats[target.id]
         if not target.available or state.circuit_open_until > now:
             continue
