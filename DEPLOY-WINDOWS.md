@@ -112,15 +112,19 @@ call .env
 exit /b 0
 ```
 
-#### 开机自启（可选）
+#### 开机自启（登录时拉起 damselfish + SearXNG）
 
-使用 **Windows Task Scheduler** 或 [NSSM](https://nssm.cc/) 将 damselfish 注册为系统服务：
+仓库自带 `scripts/autostart.vbs`（ASCII、路径自解析、隐藏窗口）。注册一次即可，**无需管理员权限**（写 HKCU Run key）：
 
+```bash
+wscript scripts/autostart.vbs install
+# 验证（应输出 wscript.exe ...autostart.vbs）
+cscript //nologo data/_verify.vbs   # 可选；或 reg query HKCU\...\Run /v Helm-AutoStart
 ```
-程序：C:\Users\<用户>\AppData\Local\Microsoft\WindowsApps\bash.exe
-参数：-c "cd /c/Users/<用户>/Helm && set -a && source .env && set +a && uv run damselfish --config config.yml"
-起始位置：C:\Users\<用户>\Helm
-```
+
+登录时 Windows 自动跑 `wscript autostart.vbs` → 隐藏 `autostart.bat` → `start-all.sh`（幂等，已在跑则跳过）。`autostart.bat` 找 Git Bash 的 `bash.exe`（按 `D:\APP\Git`、`%ProgramFiles%\Git` 顺序）。
+
+> 旧的 NSSM/Task Scheduler 方案需管理员；如改用 Task Scheduler，`schtasks /create /tn Helm-AutoStart /tr "D:\AI项目\Helm\scripts\autostart.bat" /sc onlogon /rl highest /f`（需管理员）。
 
 ---
 
@@ -242,6 +246,6 @@ curl "http://127.0.0.1:8888/search?q=test&format=json"
 - damselfish 的 API Key（`DAMSELFISH_API_KEY`）是自定义密钥，两台设备（macOS + Windows）应使用**相同的值**，确保 zcode 认证通过。
 - SearXNG 的 `secret_key` 已写入 `searxng/settings.yml` 并随仓库一起维护，Windows 端无需额外配置。
 - Windows 上建议使用 **Git Bash** 运行 shell 脚本，以避免 Bash 语法兼容问题。
-- 如需开机自启 damselfish，可使用 **Windows Task Scheduler** 或 [NSSM](https://nssm.cc/)。
+- 开机自启见上「开机自启」小节：`wscript scripts/autostart.vbs install`（注册 HKCU Run key，无需管理员；同时拉起 damselfish + SearXNG）。
 - 确保 `127.0.0.1:8086`（damselfish）和 `127.0.0.1:8888`（SearXNG）两个端口未被其他程序占用。
 - 如遇到 Windows Defender / 防火墙拦截，请为 `uv.exe`、`python.exe` 和 `bash.exe` 放行。

@@ -48,8 +48,18 @@ while :; do
   sleep "$POLL_INTERVAL"
 done
 
-echo "kickstart -k $LABEL"
-launchctl kickstart -k "gui/$(id -u)/$LABEL"
+# 重启 damselfish: macOS 用 launchd kickstart, 其它平台用 stop+start 脚本
+case "$(uname -s)" in
+  Darwin)
+    echo "launchctl kickstart -k $LABEL"
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    ;;
+  *)
+    echo "restarting via scripts/stop.sh + scripts/start.sh"
+    bash "$DIR/scripts/stop.sh"
+    bash "$DIR/scripts/start.sh"
+    ;;
+esac
 
 # 健康检查: 等服务重新监听
 for _ in $(seq 1 30); do

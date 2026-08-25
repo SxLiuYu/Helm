@@ -10,7 +10,7 @@ zcode (harness) ──default model──> damselfish (127.0.0.1:8086) ──智
   │ Skills (orchestration 等)           │ SQLite 记忆 · 熔断 · 健康检查
   │                                     │
   └── SearXNG (127.0.0.1:8888)          └── 14 个 chat 上游 (agnes/finna/stepfun)
-      Docker 宓器, JSON API
+      in-Helm venv, JSON API
 ```
 
 ## 模型
@@ -25,22 +25,25 @@ zcode 不发送 `X-Damselfish-Scenario`/`X-Damselfish-Persona` 头，damselfish 
 |---|---|---|
 | zcode config | `~/.zcode/v2/config.json` (provider UUID `13f8b742-...`) | — |
 | zcode settings | `~/.zcode/v2/setting.json` (`providerFamilyDomain` = damselfish UUID) | — |
-| damselfish | `/Users/sxliuyu/Projects/Helm/` (launchd: `com.damselfish.local`) | 8086 |
-| SearXNG | Docker 容器 `searxng-hermes` | 8888 |
+| damselfish | Helm 根目录, `bash scripts/start.sh`（Windows 自启 `autostart.vbs` / macOS launchd） | 8086 |
+| SearXNG | `searxng/`（git submodule `src/` + 自带 `.venv`，`searxng/start.sh`） | 8888 |
 | damselfish config | `config.yml` (gitignore) | — |
 | API keys | `.env` (gitignore) | — |
 
 ## 启停
 
 ```bash
-# damselfish (launchd 管理, 通常不需要手动操作)
-bash scripts/start.sh     # 手动启动
-bash scripts/stop.sh      # 手动停止
+# damselfish (8086) — Windows 开机自启: wscript scripts/autostart.vbs install
+bash scripts/start.sh          # 手动启动
+bash scripts/stop.sh           # 手动停止
 
-# SearXNG (Docker)
-docker start searxng-hermes   # 启动
-docker stop searxng-hermes    # 停止
+# SearXNG (8888, in-Helm venv, 详见 searxng/README.md)
+bash searxng/start.sh          # 启动
+bash searxng/stop.sh           # 停止
 curl -s "http://127.0.0.1:8888/search?q=test&format=json" | python3 -m json.tool  # 验证
+
+# 一键启动两者（幂等）
+bash scripts/start-all.sh
 ```
 
 ## 多角色协作
@@ -53,7 +56,7 @@ dsh 的搬砖/舵手 preset 已替换为 zcode 原生能力：
 
 ## 搜索
 
-SearXNG 运行在 Docker 中，通过 JSON API 搜索：
+SearXNG 运行在 Helm 自带的 venv 中（`searxng/`，submodule 源码 + 自带 `.venv`），通过 JSON API 搜索：
 
 ```bash
 curl -s "http://127.0.0.1:8888/search?q=python+asyncio&format=json" | python3 -m json.tool

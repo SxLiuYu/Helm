@@ -30,7 +30,7 @@ Helm，舵手。zcode 当舵手（监督 + 工具 + 循环），damselfish 选�
               ▼              ▼             ▼             ▼              ▼
          agnes (4)      finna (5)    stepfun (5)   image/video(7)   ...
 
-          SearXNG (8888, Docker) ← zcode agent 用 curl/Bash 调 JSON API 搜索
+          SearXNG (8888, in-Helm venv) ← zcode agent 用 curl/Bash 调 JSON API 搜索
 ```
 
 ## AVO 四思想 → Helm 对应
@@ -53,10 +53,13 @@ Helm/
 │   │   └── stop.sh          # 停止（按 8086 端口, macOS lsof / Windows netstat）
 │   ├── config.yml           # 路由配置 + 21 个 target（gitignore 不入库）
 │   └── .env                 # API keys（gitignore 不入库）
-├── searxng/                 # SearXNG 搜索引擎配置
-│   ├── settings.yml         # SearXNG 配置（引擎列表、端口 8888）
-│   ├── start.sh             # 启动脚本（macOS .venv/bin 或 Windows .venv/Scripts）
-│   └── stop.sh              # 停止脚本
+├── searxng/                 # SearXNG 搜索引擎（自包含）
+│   ├── src/                 # 引擎源码（git submodule, pin searxng@9fea412）
+│   ├── settings.yml         # 完整配置（端口 8888、json、zh-CN、中国引擎）
+│   ├── wincompat/pwd.py     # Windows 兼容 shim（Unix-only `pwd` 导入）
+│   ├── start.sh / stop.sh   # 跨平台启停（PID+kill-0, 不依赖 lsof）
+│   ├── .venv/               # Python 3.12 venv（src/requirements.txt, gitignore）
+│   └── data/                # PID + 日志（gitignore）
 ├── scripts/                 # 全局脚本
 │   ├── start.sh / stop.sh   # damselfish 启停
 │   ├── safe-restart.sh      # 安全重启
@@ -85,8 +88,9 @@ Helm/
 
 核心三步：
 
-1. **启动 damselfish**：`bash scripts/start.sh`（8086）— macOS 上由 launchd 自动管理
-2. **启动 SearXNG**：`docker start searxng-hermes`（8888）
+1. **启动 damselfish**：`bash scripts/start.sh`（8086）— Windows 开机自启：`wscript scripts/autostart.vbs install`
+2. **启动 SearXNG**：`bash searxng/start.sh`（8888, submodule+venv，详见 `searxng/README.md`）
+> 一键启动两者：`bash scripts/start-all.sh`（幂等）。Windows 开机自启：`wscript scripts/autostart.vbs install`（注册 HKCU Run key，详见 `DEPLOY-WINDOWS.md`）。
 3. **配置 zcode**：在 `~/.zcode/v2/config.json` 添加 damselfish provider，`setting.json` 切换 `providerFamilyDomain`
 
 详见 `README-LOCAL.md` 和 `CLAUDE.md`。
@@ -101,7 +105,7 @@ Helm/
 
 - damselfish 路由器：完成，21 target 全 available，三阶段回退验证通过
 - zcode 集成：完成，default=damselfish，端到端验证通过
-- SearXNG：Docker 部署完成，JSON API 可用
+- SearXNG：in-Helm venv（submodule + 自带 .venv）部署完成，JSON API 可用
 - 旧 dsh 配置：已归档到 `deprecated/`
 
 ## 致谢

@@ -23,12 +23,12 @@ zcode 的 default provider 设为 `damselfish`，所有 agent 请求先到本地
 
 ```bash
 bash scripts/start.sh    # 后台启动, PID 写 data/damselfish.pid, 日志 data/damselfish.log
-bash scripts/stop.sh     # 按 8086 端口找 listener (macOS lsof / Windows netstat)
+bash scripts/stop.sh     # PID-file + netstat 找 8086 listener (跨平台, 不依赖 lsof)
 ```
 
-start.sh 会 `source .env` 注入 key，并检测 8086 端口避免重复启动。
+start.sh 会 `source .env` 注入 key，并按 PID-file + `kill -0`（回退 netstat）避免重复启动。
 
-macOS 上 damselfish 由 launchd 管理 (`com.damselfish.local`)，开机自动启动，通常不需要手动操作。
+开机自启：macOS 由 launchd 管理；Windows 注册 HKCU Run key（`wscript scripts/autostart.vbs install`，无需管理员）。一键启停两者用 `bash scripts/start-all.sh`（幂等）。
 
 ## 配置文件
 
@@ -50,17 +50,19 @@ macOS 上 damselfish 由 launchd 管理 (`com.damselfish.local`)，开机自动�
 
 ## SearXNG 搜索
 
-SearXNG 运行在 Docker 容器 `searxng-hermes` 中，端口 8888：
+SearXNG 自包含在 `searxng/`：引擎源码是 git submodule（`searxng/src`，pin searxng@9fea412），独立 venv（`searxng/.venv`，Python 3.12），配置 `searxng/settings.yml`。端口 8888，开机随 `start-all.sh` 自启。
 
 ```bash
-docker start searxng-hermes   # 启动
-docker stop searxng-hermes    # 停止
+bash searxng/start.sh        # 启动
+bash searxng/stop.sh         # 停止
 curl -s "http://127.0.0.1:8888/search?q=test&format=json" | python3 -m json.tool  # 验证
 ```
 
+> 真正的 SearXNG 引擎没发布到 PyPI（PyPI 上的 `searxng` 是无关 MCP 客户端），所以从 git 源码跑。Windows 需要 `searxng/wincompat/pwd.py` shim 满足上游对 Unix-only `pwd` 的导入。详见 `searxng/README.md`。
+
 ## 注意
 
-- **damselfish 必须常驻**：zcode default=damselfish，damselfish 断了全失败。launchd 管理开机自启。
+- **damselfish 必须常驻**：zcode default=damselfish，damselfish 断了全失败。开机自启见上（Windows `autostart.vbs` / macOS launchd）。
 - damselfish 不自动 load .env，必须经 start.sh（或 `set -a; source .env; set +a`）启动。
 - image/video 模型免费但 damselfish 当前不路由（chat router 限制）。
 - 旧 dsh 配置已归档到 `deprecated/` 目录。
