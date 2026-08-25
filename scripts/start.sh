@@ -4,7 +4,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR"
 
-if netstat -ano 2>/dev/null | grep -qE ":8086.*LISTEN"; then
+if lsof -ti :8086 -sTCP:LISTEN >/dev/null 2>&1; then
   echo "damselfish already running on :8086"
   exit 0
 fi

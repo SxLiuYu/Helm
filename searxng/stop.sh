@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# 停止 SearXNG (按 8888 端口找 listener, taskkill /T)
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT=8886
+# 停止 SearXNG (按 8888 端口找 listener)
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=8888
 
-PID=$(netstat -ano 2>/dev/null | grep -E ":${PORT}\b" | grep -iE "LISTENING|LISTEN" | awk '{print $NF}' | head -1)
+if command -v lsof >/dev/null 2>&1; then
+  PID=$(lsof -ti ":${PORT}" -sTCP:LISTEN 2>/dev/null | head -1)
+else
+  PID=$(netstat -ano 2>/dev/null | grep -E ":${PORT}\b" | grep -iE "LISTENING|LISTEN" | awk '{print $NF}' | head -1)
+fi
 
 if [ -n "$PID" ]; then
   if command -v taskkill >/dev/null 2>&1; then

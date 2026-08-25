@@ -1,12 +1,12 @@
-# Damselfish 本地部署 + DSH 集成
+# Damselfish 本地部署 + zcode 集成
 
 ## 架构
 
 ```
-DSH (agent, 3080) ──default model──> damselfish (127.0.0.1:8086) ──智能路由──> 多个免费上游
+zcode (harness) ──default model──> damselfish (127.0.0.1:8086) ──智能路由──> 多个免费上游
 ```
 
-DSH 的 default provider 设为 `damselfish`，所有 agent 请求先到本地 damselfish，由 damselfish 按 **场景(scenario) + 人物(persona) + 实时延迟 + 失败率** 综合评分选最优上游，并在 429/超时/503 时三阶段回退（串行→并行竞速→串行兜底）。
+zcode 的 default provider 设为 `damselfish`，所有 agent 请求先到本地 damselfish，由 damselfish 按 **场景(scenario) + 人物(persona) + 实时延迟 + 失败率** 综合评分选最优上游，并在 429/超时/503 时三阶段回退（串行→并行竞速→串行兜底）。
 
 ## 模型池（21 个 target）
 
@@ -17,47 +17,50 @@ DSH 的 default provider 设为 `damselfish`，所有 agent 请求先到本地 d
 
 **7 个 image/video（记录在池，不参与 chat 路由）：**
 - agnes-image-2.0-flash / 2.1-flash（+cn）、agnes-video-2.5 / v2.0（+cn）
-- 注：damselfish 当前是 chat completions router，不调 image/video endpoint；要真正用这些免费图像/视频模型需扩展 damselfish 或直接调 agnes API。
+- 注：damselfish 当前是 chat completions router，不调 image/video endpoint。
 
 ## 启停
 
 ```bash
 bash scripts/start.sh    # 后台启动, PID 写 data/damselfish.pid, 日志 data/damselfish.log
-bash scripts/stop.sh     # 按 8086 端口找 listener, taskkill /T 杀整棵进程树
+bash scripts/stop.sh     # 按 8086 端口找 listener (macOS lsof / Windows netstat)
 ```
 
-start.sh 会 `source .env` 注入 key（damselfish 不自动 load .env，靠 systemd EnvironmentFile 或手动 source），并检测 8086 端口避免重复启动。
+start.sh 会 `source .env` 注入 key，并检测 8086 端口避免重复启动。
 
-## 开机自启
-
-`damselfish-autostart.bat` 已放在启动文件夹：
-`C:\Users\mi\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\`
-
-登录时 Windows 自动跑它 → Git Bash 跑 start.sh → damselfish 常驻。
+macOS 上 damselfish 由 launchd 管理 (`com.damselfish.local`)，开机自动启动，通常不需要手动操作。
 
 ## 配置文件
 
 | 文件 | 作用 |
 |---|---|
 | `config.yml` | 路由参数 + scenarios/personas + targets 列表（21 个模型） |
-| `.env` | 19 个 API key（finna 5 + agnes 2 + stepfun 10 + DAMSELFISH_API_KEY + DEVICE_ID），**gitignore 不入库** |
+| `.env` | API keys + DAMSELFISH_API_KEY，**gitignore 不入库** |
 | `data/managed-nodes.json` | admin 页面动态节点（当前清空，全用 config.yml targets） |
 | `data/damselfish.db` | SQLite 指标/路由决策/跨模型会话记忆 |
 
 ⚠️ `.env` 和 `config.yml` 都在 `.gitignore`（含密钥/本地路径），不会进 git。
 
-## DSH 集成（~/.dsh/）
+## zcode 集成（~/.zcode/v2/）
 
-- `settings.yaml` → `llm-pi-ai.providers.damselfish`：baseURL `http://127.0.0.1:8086/v1`，model `damselfish/auto`，apiKeyEnv `DAMSELFISH_API_KEY`
-- `.credentials.yaml` → `DAMSELFISH_API_KEY`（值同 damselfish/.env）
-- `agent-default-model` → `provider: damselfish, model: damselfish/auto`
-- DSH 调 damselfish 时带 `Authorization: Bearer <DAMSELFISH_API_KEY>`，damselfish 用它做 HMAC 校验
+- `config.json` → provider `damselfish`（UUID `13f8b742-7dad-4959-a062-8fed81c8d907`）：kind `openai-compatible`，baseURL `http://127.0.0.1:8086/v1`，model `damselfish/auto`
+- `setting.json` → `providerFamilyDomain` = damselfish UUID
+- zcode 调 damselfish 时带 `Authorization: Bearer df-40b09bd9ab5fed3a7375cb8c`
+- zcode 不发送 scenario/persona 头，damselfish 从消息内容自动推断
 
-改 DSH 配置后跑 `restart-dsh-web.ps1` 重启 DSH web（3080）生效。
+## SearXNG 搜索
+
+SearXNG 运行在 Docker 容器 `searxng-hermes` 中，端口 8888：
+
+```bash
+docker start searxng-hermes   # 启动
+docker stop searxng-hermes    # 停止
+curl -s "http://127.0.0.1:8888/search?q=test&format=json" | python3 -m json.tool  # 验证
+```
 
 ## 注意
 
-- **damselfish 必须常驻**：default=damselfish，damselfish 断了 DSH 全失败。开机自启 bat 解决重启后自启。
+- **damselfish 必须常驻**：zcode default=damselfish，damselfish 断了全失败。launchd 管理开机自启。
 - damselfish 不自动 load .env，必须经 start.sh（或 `set -a; source .env; set +a`）启动。
 - image/video 模型免费但 damselfish 当前不路由（chat router 限制）。
-- agnes-pro 是收费模型，已排除。
+- 旧 dsh 配置已归档到 `deprecated/` 目录。

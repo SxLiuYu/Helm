@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# 本地停止 damselfish: 找 3086 端口占用者, taskkill /T 整棵进程树
-# (start.sh 的 $! 是 nohup bash PID, kill 它杀不掉 uv->python 子进程,
-#  所以按端口找真正的 listener PID 更可靠)
+# 本地停止 damselfish: 找 8086 端口占用者, macOS 用 lsof, Windows 用 netstat+taskkill
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT=3086
+PORT=8086
 
-PID=$(netstat -ano 2>/dev/null | grep -E ":${PORT}\b" | grep -iE "LISTENING|LISTEN" | awk '{print $NF}' | head -1)
+if command -v lsof >/dev/null 2>&1; then
+  PID=$(lsof -ti ":${PORT}" -sTCP:LISTEN 2>/dev/null | head -1)
+else
+  PID=$(netstat -ano 2>/dev/null | grep -E ":${PORT}\b" | grep -iE "LISTENING|LISTEN" | awk '{print $NF}' | head -1)
+fi
 
 if [ -n "$PID" ]; then
   if command -v taskkill >/dev/null 2>&1; then
