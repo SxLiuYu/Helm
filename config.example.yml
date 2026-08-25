@@ -94,14 +94,28 @@ scenarios:
     quality_weight: 2.5
 
 personas:
+  # ── 多角色协作 pipeline 用（evaluator→developer→reviewer→tester）──
+  # plan_collaboration() 按 CANONICAL_ORDER ∩ config.personas 过滤可用角色，
+  # 必须在这里定义这 3 个角色，否则协作 pipeline 凑不齐 ≥2 角色永不触发。
+  # keywords 与 damselfish/pipeline.py STAGES 的 patterns 一致（自动识别）。
+  evaluator:
+    keywords: [评估, 评测, 诊断, 根因, 风险]
+    preferred: [reasoning, coding]
   developer:
-    keywords: ["软件工程师", "开发者", "programmer", "developer"]
+    keywords: ["软件工程师", 开发者, programmer, developer, 修复, 实现, 重构]
     preferred: [coding, tools]
+  reviewer:
+    keywords: [审查, 评审, review, 把关, 检查, 挑错]
+    preferred: [reasoning, coding]
+  tester:
+    keywords: [测试, 单测, 用例, 回归, 验证]
+    preferred: [coding, tools, reasoning]
+  # ── 路由偏好 persona（非协作）──
   operator:
-    keywords: ["运维工程师", "devops", "sre"]
+    keywords: ["运维工程师", devops, sre]
     preferred: [coding, tools, reasoning]
   writer:
-    keywords: ["作家", "文案", "writer"]
+    keywords: ["作家", 文案, writer]
     preferred: [creative, multilingual]
 
 # ── Provider 可插拔配置 ──────────────────────────────────────────────
