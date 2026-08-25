@@ -18,6 +18,16 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 accurate-tokens = ["tiktoken>=0.5"]
+office = [
+  "python-docx",
+  "openpyxl",
+  "xlsxwriter",
+  "python-pptx",
+  "pypdf",
+  "pdfplumber",
+  "fpdf2",
+  "reportlab",
+]
 
 [project.scripts]
 damselfish = "damselfish.cli:main"
