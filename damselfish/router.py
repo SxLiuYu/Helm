@@ -58,6 +58,15 @@ class ModelRouter:
     _WINDOW_MIN = 8
     _WINDOW_RATE = 0.8
 
+    # Per-provider-family concurrency limits.  Finna targets share a single
+    # account with ~10 concurrent slots; the per-target semaphores (2 each)
+    # can't prevent a parallel race from saturating all slots at once.
+    _FAMILY_CONCURRENCY: dict[str, int] = {
+        "finna": 4,      # 5 targets, 4 concurrent max → 6 slots for serial
+        "stepfun": 6,    # 6 chat targets, 6 concurrent max
+        "agnes": 2,      # 2 chat targets, 2 concurrent max
+    }
+
     def __init__(
         self, config: AppConfig, store: Store, client: httpx.AsyncClient
     ) -> None:
@@ -68,6 +77,7 @@ class ModelRouter:
             target.id: asyncio.Semaphore(target.max_concurrency)
             for target in config.targets
         }
+        self._family_semaphores = self._build_family_semaphores(config.targets)
         self._raced_ids: set[str] = set()
         # For stream race: store winner's iterator and first chunk so caller
         # can continue streaming after the race succeeds.
@@ -107,6 +117,24 @@ class ModelRouter:
         log.warning("target=%s status=200 circuit_seconds=%.0f error=%s",
                     target_id, delay, message)
 
+    def _build_family_semaphores(
+        self, targets: tuple[TargetConfig, ...]
+    ) -> dict[str, asyncio.Semaphore]:
+        """Build per-provider-family semaphores from target id prefixes."""
+        result: dict[str, asyncio.Semaphore] = {}
+        for target in targets:
+            family = self._family_for(target.id)
+            if family not in result:
+                limit = self._FAMILY_CONCURRENCY.get(family, 0)
+                if limit > 0:
+                    result[family] = asyncio.Semaphore(limit)
+        return result
+
+    @staticmethod
+    def _family_for(target_id: str) -> str:
+        """Derive the provider family from a target id prefix."""
+        return target_id.split("-")[0] if "-" in target_id else target_id
+
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
         self._semaphores = {
@@ -115,6 +143,7 @@ class ModelRouter:
             )
             for target in config.targets
         }
+        self._family_semaphores = self._build_family_semaphores(config.targets)
 
     def _apply_session_pin(
         self,
@@ -546,10 +575,21 @@ class ModelRouter:
     async def _call(
         self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
     ) -> CompletionResult:
-        """In-flight gauge wrapper around ``_call_once``."""
+        """In-flight gauge wrapper around ``_call_once``.
+
+        Retries once on empty-choices responses (HTTP 200 with no ``choices``
+        array), which some upstreams return under concurrency pressure.
+        """
         self.in_flight += 1
         try:
-            return await self._call_once(target, payload, probe)
+            for attempt in range(2):
+                try:
+                    return await self._call_once(target, payload, probe)
+                except UpstreamFailure as error:
+                    if attempt == 0 and error.status == 502 and "no choices" in str(error):
+                        await asyncio.sleep(1)
+                        continue
+                    raise
         finally:
             self.in_flight -= 1
 
@@ -565,11 +605,20 @@ class ModelRouter:
         if target.api_key:
             headers["Authorization"] = f"Bearer {target.api_key}"
         started = time.monotonic()
+        family = self._family_for(target.id)
+        family_sem = self._family_semaphores.get(family)
         try:
-            async with self._semaphores[target.id]:
-                response = await self.client.post(
-                    target.chat_url, headers=headers, json=request
-                )
+            if family_sem is not None:
+                async with family_sem:
+                    async with self._semaphores[target.id]:
+                        response = await self.client.post(
+                            target.chat_url, headers=headers, json=request
+                        )
+            else:
+                async with self._semaphores[target.id]:
+                    response = await self.client.post(
+                        target.chat_url, headers=headers, json=request
+                    )
             latency_ms = (time.monotonic() - started) * 1000
             if response.status_code < 200 or response.status_code >= 300:
                 raise UpstreamFailure(
@@ -655,11 +704,20 @@ class ModelRouter:
             headers["Authorization"] = f"Bearer {target.api_key}"
         _first_yielded = False
         started = time.monotonic()
+        family = self._family_for(target.id)
+        family_sem = self._family_semaphores.get(family)
         try:
-            async with self._semaphores[target.id]:
-                response = await self.client.post(
-                    target.chat_url, headers=headers, json=request
-                )
+            if family_sem is not None:
+                async with family_sem:
+                    async with self._semaphores[target.id]:
+                        response = await self.client.post(
+                            target.chat_url, headers=headers, json=request
+                        )
+            else:
+                async with self._semaphores[target.id]:
+                    response = await self.client.post(
+                        target.chat_url, headers=headers, json=request
+                    )
             if response.status_code < 200 or response.status_code >= 300:
                 raise UpstreamFailure(
                     target, response.status_code, _error_message(response),

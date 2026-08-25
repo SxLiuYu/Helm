@@ -546,10 +546,10 @@ def test_streaming_meta_event_injected(tmp_path: Path, monkeypatch) -> None:
         )
     assert response.status_code == 200
     body = response.text
-    assert "event: meta" in body
-    assert "latency_ms" in body
-    assert "target" in body
-    assert "local-model" in body
+    # Streaming data lines must be valid chat.completion.chunk JSON.
+    # Non-standard SSE event types (e.g. "event: meta") are no longer emitted.
+    assert "data: {" in body
+    assert "delta" in body
 
 
 def test_health_endpoint_deep_check(tmp_path: Path) -> None:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 
 import uvicorn
 
@@ -18,10 +20,30 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config)
     os.environ["DAMSELFISH_CONFIG"] = args.config
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+
+    level = getattr(logging, args.log_level.upper())
+    fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s")
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(fmt)
+
+    # Rotating file handler (10 MB × 3 backups)
+    config_dir = Path(args.config).resolve().parent
+    log_dir = config_dir / "data"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        log_dir / "damselfish.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
     )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(fmt)
+
+    logging.basicConfig(level=level, handlers=[console, file_handler])
+
     uvicorn.run(
         "damselfish.app:build_default_app",
         factory=True,
