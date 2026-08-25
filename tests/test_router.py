@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 import httpx
@@ -8,10 +9,12 @@ from damselfish.config import AppConfig, RoutingConfig, TargetConfig
 from damselfish.router import (
     ModelRouter,
     UpstreamFailure,
+    _ensure_tool_call_ids,
     _estimate_current_input_tokens,
     _estimate_text_tokens,
     _is_context_overflow,
     _max_new_tokens,
+    _retry_after_seconds,
     _upstream_payload,
 )
 from damselfish.selector import RouteContext
@@ -1041,4 +1044,248 @@ def test_stream_complete_serial_fallback_yields_multiple_chunks(tmp_path: Path) 
             assert router._stream_result.target.id == "backup"
 
     asyncio.run(run())
+    store.close()
+
+
+# ── _ensure_tool_call_ids tests ──────────────────────────────────────
+
+
+def test_ensure_tool_call_ids_pairs_orphan_tool_results() -> None:
+    """Orphan tool results inherit the nearest preceding assistant tool_call id."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_abc", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}},
+                {"id": "call_def", "type": "function",
+                 "function": {"name": "g", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "content": "r1"},
+        {"role": "tool", "content": "r2"},
+    ]
+    out = _ensure_tool_call_ids(messages)
+    assert out[2]["tool_call_id"] == "call_abc"
+    assert out[3]["tool_call_id"] == "call_def"
+
+
+def test_ensure_tool_call_ids_synthesizes_without_pending() -> None:
+    """A tool result with no preceding assistant tool_calls gets a synthetic id."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "content": "orphan"},
+    ]
+    out = _ensure_tool_call_ids(messages)
+    assert out[1]["tool_call_id"].startswith("call_dsf_")
+
+
+def test_ensure_tool_call_ids_fills_missing_assistant_call_ids() -> None:
+    """Assistant tool_calls without ids get synthesized, then pair with the tool result."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"type": "function", "function": {"name": "f", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "content": "r1"},
+    ]
+    out = _ensure_tool_call_ids(messages)
+    call_id = out[0]["tool_calls"][0]["id"]
+    assert call_id.startswith("call_dsf_")
+    assert out[1]["tool_call_id"] == call_id
+
+
+def test_ensure_tool_call_ids_leaves_complete_history() -> None:
+    """Already-valid histories pass through untouched."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "call_x", "type": "function",
+                            "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_x", "content": "r"},
+    ]
+    out = _ensure_tool_call_ids(messages)
+    assert out[2]["tool_call_id"] == "call_x"
+    assert out[1]["tool_calls"][0]["id"] == "call_x"
+
+
+def test_upstream_payload_synthesizes_tool_call_ids() -> None:
+    """_upstream_payload runs the tool_call_id fixup on outbound messages."""
+    target = TargetConfig("test", "Test", "http://t/v1", "t", local=True)
+    payload = {
+        "messages": [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_k", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "content": "r"},
+        ],
+    }
+    request, _ = _upstream_payload(payload, target, probe=False)
+    assert request["messages"][1]["tool_call_id"] == "call_k"
+
+
+# ── _retry_after_seconds tests ───────────────────────────────────────
+
+
+def test_retry_after_parses_seconds() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "30"})
+    assert _retry_after_seconds(response) == 30.0
+
+
+def test_retry_after_accepts_float() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "1.5"})
+    assert _retry_after_seconds(response) == 1.5
+
+
+def test_retry_after_missing_header_is_zero() -> None:
+    response = httpx.Response(429)
+    assert _retry_after_seconds(response) == 0.0
+
+
+def test_retry_after_invalid_value_is_zero() -> None:
+    """Non-numeric (e.g. HTTP-date) forms are ignored."""
+    response = httpx.Response(429, headers={"Retry-After": "soon"})
+    assert _retry_after_seconds(response) == 0.0
+
+
+def test_retry_after_negative_clamps_to_zero() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "-5"})
+    assert _retry_after_seconds(response) == 0.0
+
+
+def test_router_honors_retry_after_header(tmp_path: Path) -> None:
+    """429 with Retry-After opens the circuit for at least that long."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        # Tiny base so the normal backoff would be ~0s; only Retry-After
+        # can produce a long circuit.
+        routing=RoutingConfig(circuit_base_seconds=0.01, circuit_max_seconds=300),
+        targets=(TargetConfig("only", "Only", "http://router/v1", "m", local=True),),
+    )
+    store = Store(config.database, ["only"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "45"},
+                              json={"error": {"message": "limited"}})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            with pytest.raises(Exception):
+                await router.complete(
+                    {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                    RouteContext("default", None, frozenset(), frozenset(), ()),
+                    "test",
+                )
+
+    asyncio.run(run())
+    assert store.stats("only").circuit_open_until > time.time() + 30
+    store.close()
+
+
+# ── sliding-window circuit breaker tests ─────────────────────────────
+
+
+def _breaker_router(tmp_path: Path, base: float = 15.0) -> tuple[ModelRouter, Store]:
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(circuit_base_seconds=base, circuit_max_seconds=300),
+        targets=(TargetConfig("flaky", "Flaky", "http://router/v1", "m", local=True),),
+    )
+    store = Store(config.database, ["flaky"])
+    client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=_success_response("m"))
+    ))
+    return ModelRouter(config, store, client), store
+
+
+def test_sliding_window_no_trip_below_min(tmp_path: Path) -> None:
+    """Fewer than _WINDOW_MIN outcomes never trips the breaker."""
+    router, store = _breaker_router(tmp_path)
+    for _ in range(router._WINDOW_MIN - 1):
+        router._record_outcome("flaky", False)
+    assert store.stats("flaky").circuit_open_until == 0
+    store.close()
+
+
+def test_sliding_window_trips_on_chronic_flakiness(tmp_path: Path) -> None:
+    """Intermittent successes keep resetting consecutive-failure counts; the
+    window catches a target whose success rate stays below threshold."""
+    router, store = _breaker_router(tmp_path)
+    for i in range(router._WINDOW_MIN):
+        router._record_outcome("flaky", i % 3 == 2)  # 2 successes / 6 fails
+    open_until = store.stats("flaky").circuit_open_until
+    assert open_until > time.time() + 50  # delay = max(base*4, 60) = 60s
+    # Window cleared after trip so recovery isn't instantly re-quarantined.
+    assert len(router._outcomes["flaky"]) == 0
+    store.close()
+
+
+def test_sliding_window_no_trip_at_threshold_rate(tmp_path: Path) -> None:
+    """Exactly-threshold success rate (>= 80%) does not trip."""
+    router, store = _breaker_router(tmp_path)
+    outcomes = [False] * 2 + [True] * (router._WINDOW_SIZE - 2)
+    for ok in outcomes:  # success rate 18/20 = 90% >= 80%
+        router._record_outcome("flaky", ok)
+    assert store.stats("flaky").circuit_open_until == 0
+    store.close()
+
+
+def test_sliding_window_successes_keep_circuit_closed(tmp_path: Path) -> None:
+    """A healthy target is never quarantined regardless of volume."""
+    router, store = _breaker_router(tmp_path)
+    for _ in range(router._WINDOW_SIZE * 3):
+        router._record_outcome("flaky", True)
+    assert store.stats("flaky").circuit_open_until == 0
+    store.close()
+
+
+def test_record_failure_feeds_sliding_window(tmp_path: Path) -> None:
+    """Upstream failures recorded through _record_failure count toward the window."""
+    router, store = _breaker_router(tmp_path)
+    target = router.config.targets[0]
+    for _ in range(router._WINDOW_MIN):
+        router._record_failure(target, 500, "boom", probe=False)
+    assert store.stats(target.id).circuit_open_until > time.time() + 50
+    store.close()
+
+
+# ── in-flight gauge tests ────────────────────────────────────────────
+
+
+def test_in_flight_gauge_tracks_and_drains(tmp_path: Path) -> None:
+    """in_flight is positive while the upstream call is running and 0 after."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(TargetConfig("t1", "T1", "http://router/v1", "m", local=True),),
+    )
+    store = Store(config.database, ["t1"])
+    holder: dict[str, ModelRouter] = {}
+    observed: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(holder["router"].in_flight)
+        return httpx.Response(200, json=_success_response("m"))
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            holder["router"] = router
+            await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            )
+
+    asyncio.run(run())
+    assert observed and all(value >= 1 for value in observed)
+    assert holder["router"].in_flight == 0
     store.close()
