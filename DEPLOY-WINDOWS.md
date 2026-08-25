@@ -77,8 +77,9 @@ copy .env.example .env
 ### 3. 安装依赖并启动 damselfish
 
 ```bash
-# 同步依赖
-uv sync
+# 同步依赖（--extra office 一并装 office-files skill 依赖：python-docx/openpyxl/pdfplumber 等；
+# 不加 --extra office，下次 uv sync 会把这些库清掉）
+uv sync --extra office
 
 # 启动 damselfish（Git Bash / WSL）
 bash scripts/start.sh
@@ -125,24 +126,38 @@ exit /b 0
 
 ### 4. 启动 SearXNG
 
-#### 方案 A：Docker（推荐）
+SearXNG 引擎源码作为 git submodule 放在 `searxng/src/`（真正的搜索引擎没发布到 PyPI，只能从 git 源码跑；详见 `searxng/README.md`）。
 
-确保 Docker Desktop 已启动，然后运行：
+#### 方案 A：Python venv + submodule（本机已用，推荐）
+
+```bash
+# 4.1 拉取 submodule（引擎源码，101MB）
+git submodule update --init searxng/src
+# Windows 若报含 ':' 的模板文件无法 checkout：
+#   git -c core.protectNTFS=false submodule update --init searxng/src
+
+# 4.2 建 venv 装依赖（pypi.org 国内连不上，用清华镜像）
+uv venv searxng/.venv --python 3.12
+uv pip install -r searxng/src/requirements.txt \
+  --python searxng/.venv/Scripts/python.exe \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+uv pip install tzdata --python searxng/.venv/Scripts/python.exe \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple   # 修 Asia/Shanghai zoneinfo 报错
+
+# 4.3 启停
+bash searxng/start.sh   # 端口 8888
+bash searxng/stop.sh
+```
+
+> Windows 兼容：`searxng/wincompat/pwd.py` 是 shim，满足上游 `searx/valkeydb.py` 对 `pwd`（Unix-only）的导入；`start.sh` 用 `cygpath` 把路径转 Windows 格式、PID-file + `kill -0` 守卫，不依赖 `lsof`。
+
+#### 方案 B：Docker（可选，本机未装 Docker）
 
 ```bash
 docker run -d --name searxng-hermes -p 8888:8080 -v "%cd%/searxng/settings.yml:/etc/searxng/settings.yml:ro" --restart unless-stopped searxng/searxng:latest
 ```
 
-> **说明**：`searxng/settings.yml` 中的 `secret_key` 已内置在仓库中，无需额外配置。
-
-#### 方案 B：Python 虚拟环境（无需 Docker）
-
-```bash
-cd searxng
-python -m venv .venv
-.venv\Scripts\pip install searxng
-.venv\Scripts\python -m searx.webapp
-```
+> `searxng/settings.yml` 是完整配置（含 `secret_key`、json 格式、中国引擎、`default_doi_resolver`），Docker 与 venv 两种方式都用它。
 
 ---
 

@@ -4,12 +4,13 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR"
 
-if lsof -ti :8086 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "damselfish already running on :8086"
-  exit 0
-fi
+# 已运行则退出: 先 PID-file + kill -0, 再回退 netstat 找 8086 listener (跨平台, 不依赖 lsof)
 if [ -f data/damselfish.pid ] && kill -0 "$(cat data/damselfish.pid)" 2>/dev/null; then
   echo "damselfish already running pid=$(cat data/damselfish.pid)"
+  exit 0
+fi
+if [ -n "$(netstat -ano 2>/dev/null | grep -E ':8086\b' | grep -iE 'LISTENING|LISTEN' | head -1)" ]; then
+  echo "damselfish already running on :8086 (port in use)"
   exit 0
 fi
 

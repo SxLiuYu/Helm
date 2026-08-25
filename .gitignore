@@ -3,6 +3,7 @@
 !.env.example
 .DS_Store
 .venv/
+.zcode/
 /config.yml
 /config.yml.pre-*
 __pycache__/
