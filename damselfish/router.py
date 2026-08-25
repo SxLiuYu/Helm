@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -27,10 +28,25 @@ class CompletionResult:
 
 
 class UpstreamFailure(Exception):
-    def __init__(self, target: TargetConfig, status: int, message: str) -> None:
+    def __init__(
+        self, target: TargetConfig, status: int, message: str,
+        retry_after: float = 0.0,
+    ) -> None:
         super().__init__(message)
         self.target = target
         self.status = status
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """Parse the Retry-After header (seconds form) if the upstream sent one."""
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return 0.0
+    try:
+        return max(float(raw.strip()), 0.0)
+    except ValueError:
+        return 0.0
 
 
 class NoTargetAvailable(Exception):
@@ -38,6 +54,10 @@ class NoTargetAvailable(Exception):
 
 
 class ModelRouter:
+    _WINDOW_SIZE = 20
+    _WINDOW_MIN = 8
+    _WINDOW_RATE = 0.8
+
     def __init__(
         self, config: AppConfig, store: Store, client: httpx.AsyncClient
     ) -> None:
@@ -53,6 +73,39 @@ class ModelRouter:
         # can continue streaming after the race succeeds.
         self._race_winner_iterator: AsyncIterator[dict] | None = None
         self._race_first_chunk: dict[str, Any] | None = None
+        # In-flight upstream request gauge (exposed via /stats) so deploys can
+        # wait for streams to drain instead of killing them mid-flight.
+        self.in_flight = 0
+        # Sliding success-rate window per target (last N outcomes).  The
+        # consecutive-failure circuit never trips on chronically flaky targets
+        # (intermittent successes keep resetting the count), so a windowed
+        # success rate is needed to quarantine them.
+        self._outcomes: dict[str, deque[bool]] = {}
+
+    def _record_outcome(self, target_id: str, ok: bool) -> None:
+        window = self._outcomes.setdefault(
+            target_id, deque(maxlen=self._WINDOW_SIZE)
+        )
+        window.append(ok)
+        if ok or len(window) < self._WINDOW_MIN:
+            return
+        rate = sum(window) / len(window)
+        if rate >= self._WINDOW_RATE:
+            return
+        delay = min(
+            max(self.config.routing.circuit_base_seconds * 4.0, 60.0),
+            self.config.routing.circuit_max_seconds,
+        )
+        message = (
+            f"sliding-window quarantine: success rate {rate:.0%} "
+            f"over last {len(window)} requests"
+        )
+        self.store.record_failure(
+            target_id, 200, message, time.time() + delay, False
+        )
+        window.clear()
+        log.warning("target=%s status=200 circuit_seconds=%.0f error=%s",
+                    target_id, delay, message)
 
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
@@ -459,6 +512,16 @@ class ModelRouter:
     async def _call(
         self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
     ) -> CompletionResult:
+        """In-flight gauge wrapper around ``_call_once``."""
+        self.in_flight += 1
+        try:
+            return await self._call_once(target, payload, probe)
+        finally:
+            self.in_flight -= 1
+
+    async def _call_once(
+        self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
+    ) -> CompletionResult:
         request, capped = _upstream_payload(payload, target, probe)
         if capped:
             self.store.record_cap(target.id)
@@ -476,7 +539,8 @@ class ModelRouter:
             latency_ms = (time.monotonic() - started) * 1000
             if response.status_code < 200 or response.status_code >= 300:
                 raise UpstreamFailure(
-                    target, response.status_code, _error_message(response)
+                    target, response.status_code, _error_message(response),
+                    retry_after=_retry_after_seconds(response),
                 )
             body = response.json()
             if isinstance(body.get("data"), dict) and "choices" in body["data"]:
@@ -495,7 +559,8 @@ class ModelRouter:
                     target, 502, f"canned refusal: {_refusal_text[:80]}",
                 )
         except UpstreamFailure as error:
-            self._record_failure(target, error.status, str(error), probe)
+            self._record_failure(target, error.status, str(error), probe,
+                                 error.retry_after)
             raise
         except httpx.TimeoutException as error:
             failure = UpstreamFailure(target, 504, f"timeout: {error}")
@@ -512,6 +577,7 @@ class ModelRouter:
             completion_tokens=int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0,
             total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
         )
+        self._record_outcome(target.id, True)
         body["model"] = target.model
         _content = ""
         try:
@@ -524,6 +590,17 @@ class ModelRouter:
         return CompletionResult(body=body, target=target, latency_ms=latency_ms)
 
     async def _stream_call(
+        self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
+    ) -> AsyncIterator[dict[str, Any]]:
+        """In-flight gauge wrapper around ``_stream_call_once``."""
+        self.in_flight += 1
+        try:
+            async for chunk in self._stream_call_once(target, payload, probe):
+                yield chunk
+        finally:
+            self.in_flight -= 1
+
+    async def _stream_call_once(
         self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
     ) -> AsyncIterator[dict[str, Any]]:
         """Send a streaming request and yield normalized SSE chunks.
@@ -551,7 +628,8 @@ class ModelRouter:
                 )
             if response.status_code < 200 or response.status_code >= 300:
                 raise UpstreamFailure(
-                    target, response.status_code, _error_message(response)
+                    target, response.status_code, _error_message(response),
+                    retry_after=_retry_after_seconds(response),
                 )
             latency_ms = (time.monotonic() - started) * 1000
             content_type = response.headers.get("content-type", "").lower()
@@ -570,6 +648,7 @@ class ModelRouter:
                     completion_tokens=int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                     total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                 )
+                self._record_outcome(target.id, True)
                 _first_yielded = True
                 yield normalized
                 return
@@ -607,6 +686,7 @@ class ModelRouter:
                         completion_tokens=int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                         total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                     )
+                    self._record_outcome(target.id, True)
                 elif isinstance(usage, dict):
                     self.store.record_usage(
                         target.id,
@@ -617,7 +697,8 @@ class ModelRouter:
                 yield normalized
         except UpstreamFailure as error:
             if not _first_yielded:
-                self._record_failure(target, error.status, str(error), probe)
+                self._record_failure(target, error.status, str(error), probe,
+                                     error.retry_after)
             raise
         except httpx.TimeoutException as error:
             failure = UpstreamFailure(target, 504, f"timeout: {error}")
@@ -631,8 +712,10 @@ class ModelRouter:
             raise failure from error
 
     def _record_failure(
-        self, target: TargetConfig, status: int, message: str, probe: bool
+        self, target: TargetConfig, status: int, message: str, probe: bool,
+        retry_after: float = 0.0,
     ) -> None:
+        self._record_outcome(target.id, False)
         state = self.store.stats(target.id)
         count = state.consecutive_failures + 1
         if status == 429:
@@ -650,6 +733,9 @@ class ModelRouter:
         if delay > 0:
             jitter = random.uniform(0, delay * 0.2)
             delay = min(delay + jitter, self.config.routing.circuit_max_seconds)
+        # Never retry sooner than the upstream's own backpressure hint.
+        if retry_after > delay:
+            delay = min(retry_after, self.config.routing.circuit_max_seconds)
         self.store.record_failure(
             target.id, status, message, time.time() + delay, probe
         )
@@ -876,10 +962,49 @@ UPSTREAM_FIELDS = {
 }
 
 
+def _ensure_tool_call_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Synthesize missing tool_call ids so schema-strict upstreams accept the request.
+
+    Some clients (or memory-restored histories) emit ``tool`` role messages
+    without ``tool_call_id``, or assistant ``tool_calls`` without ``id``.
+    Providers like stepfun reject those with 400 "invalid tool message,
+    tool_call_id is required".  Pairing each orphan tool result with the
+    nearest preceding assistant tool_call id keeps the thread coherent;
+    anything left over gets a synthetic id.
+    """
+    counter = 0
+    pending_ids: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            calls = msg.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if isinstance(call, dict) and not call.get("id"):
+                        counter += 1
+                        call["id"] = f"call_dsf_{counter:06d}"
+                pending_ids = [
+                    call["id"] for call in calls
+                    if isinstance(call, dict) and call.get("id")
+                ]
+            else:
+                pending_ids = []
+        elif role == "tool" and not msg.get("tool_call_id"):
+            if pending_ids:
+                msg["tool_call_id"] = pending_ids.pop(0)
+            else:
+                counter += 1
+                msg["tool_call_id"] = f"call_dsf_{counter:06d}"
+    return messages
+
+
 def _upstream_payload(
     payload: dict[str, Any], target: TargetConfig, probe: bool
 ) -> tuple[dict[str, Any], bool]:
     request = {key: value for key, value in payload.items() if key in UPSTREAM_FIELDS}
+    request["messages"] = _ensure_tool_call_ids(request.get("messages", []))
     request["model"] = target.model
     request["stream"] = False
     if probe:

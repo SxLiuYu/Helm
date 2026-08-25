@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,6 +30,13 @@ log = logging.getLogger("damselfish")
 
 def create_app(config: AppConfig | None = None, config_path: str | Path | None = None) -> FastAPI:
     loaded = config or load_config(config_path)
+    # Path remembered so SIGHUP reloads re-read the same file even when the
+    # app was constructed with an explicit ``config`` object (e.g. tests).
+    _config_file = (
+        Path(config_path).expanduser()
+        if config_path
+        else Path(os.environ.get("DAMSELFISH_CONFIG", "config.yml")).expanduser()
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -53,9 +61,41 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         app.state.router = router
         app.state.memory_sync = memory_sync
         app.state.started_at = time.time()
+
+        async def reload_config() -> None:
+            """Hot-reload config.yml without dropping in-flight streams."""
+            try:
+                fresh = load_config(_config_file)
+            except Exception as error:
+                log.error("SIGHUP config reload failed, keeping previous config: %s", error)
+                return
+            store.ensure_targets([target.id for target in fresh.targets])
+            router.reconfigure(fresh)
+            app.state.config = fresh
+            log.info(
+                "config reloaded (SIGHUP): %d targets (%d enabled)",
+                len(fresh.targets),
+                sum(1 for t in fresh.targets if t.enabled),
+            )
+
+        loop = asyncio.get_running_loop()
+
+        def _on_sighup() -> None:
+            loop.create_task(reload_config())
+
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+        except (NotImplementedError, AttributeError, RuntimeError):
+            # NotImplementedError: platform without SIGHUP support;
+            # RuntimeError: not the main thread (e.g. TestClient).
+            pass
         try:
             yield
         finally:
+            try:
+                loop.remove_signal_handler(signal.SIGHUP)
+            except (NotImplementedError, AttributeError, RuntimeError):
+                pass
             stop.set()
             # Give in-flight requests up to 10 seconds to finish gracefully.
             try:
@@ -157,8 +197,12 @@ load();setInterval(load,10000);
 
     @app.get("/stats")
     async def stats(request: Request) -> dict[str, Any]:
+        # Read the CURRENT config (not the startup closure) so SIGHUP reloads
+        # are reflected immediately.
+        loaded = request.app.state.config
         states = request.app.state.store.all_stats()
         return {
+            "in_flight": request.app.state.router.in_flight,
             "targets": {
                 target.id: {
                     "label": target.label,
@@ -178,7 +222,8 @@ load();setInterval(load,10000);
         }
 
     @app.get("/v1/models")
-    async def models() -> dict[str, Any]:
+    async def models(request: Request) -> dict[str, Any]:
+        loaded = request.app.state.config
         created = int(time.time())
         entries = [{"id": "damselfish/auto", "object": "model", "created": created, "owned_by": "damselfish"}]
         entries.extend(
@@ -209,6 +254,8 @@ load();setInterval(load,10000);
             raise HTTPException(status_code=400, detail="request body must be JSON") from error
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(status_code=400, detail="messages must be an array")
+        # Read the CURRENT config so SIGHUP reloads take effect without restart.
+        loaded = request.app.state.config
 
         extension = payload.pop("damselfish", {}) or {}
         if not isinstance(extension, dict):
