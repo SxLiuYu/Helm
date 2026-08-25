@@ -27,8 +27,8 @@ SELECT target_id, COUNT(*) AS att, SUM(success) AS ok,
        ROUND(100.0*SUM(success)/COUNT(*),1) || '%' AS rate
 FROM decisions, win WHERE created_at > t0
 GROUP BY target_id ORDER BY att DESC LIMIT 12;"
-echo "--- 熔断/隔离事件 ---"
-grep -cE "circuit_seconds|sliding-window quarantine" "$LOG" || true
+echo "--- 窗口内熔断/隔离事件 ---"
+grep -E "circuit_seconds|sliding-window quarantine" "$LOG" | awk -v d="$(date -v-${HOURS}H '+%Y-%m-%d %H:%M')" '$0 >= d' | wc -l | xargs echo "窗口内约:"
 echo "--- 近期重启次数(按日志内 startup 行) ---"
 grep "pruned.*on startup" "$LOG" | tail -200 | awk -v d="$(date -v-${HOURS}H '+%Y-%m-%d %H:%M')" '$0 >= d' | wc -l | xargs echo "窗口内约:"
 echo "--- 客户端可见错误(整个当前日志文件) ---"
